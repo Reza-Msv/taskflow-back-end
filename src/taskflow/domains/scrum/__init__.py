@@ -1,0 +1,1 @@
+"""Scrum domain package."""

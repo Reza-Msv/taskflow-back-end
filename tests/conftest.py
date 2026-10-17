@@ -10,7 +10,12 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import StaticPool
 
 # Import all models to register with Base.metadata
+import taskflow.domains.collaboration.models  # noqa: F401
 import taskflow.domains.identity.models  # noqa: F401
+import taskflow.domains.organizations.models  # noqa: F401
+import taskflow.domains.projects.models  # noqa: F401
+import taskflow.domains.scrum.models  # noqa: F401
+import taskflow.domains.work_items.models  # noqa: F401
 from taskflow.api.deps import get_db
 from taskflow.core.config import settings
 from taskflow.db.base import Base
