@@ -19,7 +19,7 @@
 - **Database Driver**: `asyncpg` (PostgreSQL)
 - **Migrations**: Alembic
 - **Validation & Settings**: Pydantic v2 & Pydantic-Settings
-- **Security**: Argon2id password hashing (`argon2-cffi`), JWT / Session auth
+- **Security**: Argon2id (`argon2-cffi`), HttpOnly session cookies, CSRF protection, SHA-256 token hashing
 - **Testing & Quality**: Pytest, Pytest-AsyncIO, HTTPX, Ruff, Mypy, Pre-commit, Pip-audit
 
 ---
@@ -28,13 +28,13 @@
 ```text
 taskflow-back-end/
 ├── .agents/             # Agent rules and architecture guidelines
-├── alembic/             # Async database schema migrations
+├── alembic/             # Async database schema migrations (Alembic)
 ├── docs/                # Architecture, API contracts, database, security docs
 ├── src/taskflow/
 │   ├── core/            # Config, security, exceptions, logging
 │   ├── db/              # Base ORM models, async session factory
-│   ├── api/             # API routes, v1 router, dependencies
-│   └── domains/         # Domain business logic (identity, orgs, projects, work items, scrum)
+│   ├── api/             # API routes, v1 router, dependencies (deps.py)
+│   └── domains/         # Domain business logic (identity [implemented], orgs, projects, work items, scrum)
 ├── tests/               # Unit, integration, and API test suites
 ├── .pre-commit-config.yaml # Pre-commit hooks configuration
 └── pyproject.toml       # Python package, ruff, mypy, and pytest configuration

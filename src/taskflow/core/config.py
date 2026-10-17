@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,9 +27,11 @@ class Settings(BaseSettings):
 
     SESSION_COOKIE_NAME: str = "taskflow_session"
     SESSION_COOKIE_SECURE: bool = False
-    SESSION_COOKIE_SAMESITE: str = "lax"
+    SESSION_COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+    CSRF_COOKIE_NAME: str = "taskflow_csrf"
+    CSRF_HEADER_NAME: str = "X-CSRF-Token"
 
-    ENABLE_PUBLIC_REGISTRATION: bool = False
+    ENABLE_PUBLIC_REGISTRATION: bool = True
     MAX_BULK_UPDATE_LIMIT: int = 50
 
     model_config = SettingsConfigDict(

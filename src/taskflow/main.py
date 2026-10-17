@@ -1,11 +1,16 @@
 import uuid
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from taskflow.api.v1.router import router as api_v1_router
 from taskflow.core.config import settings
-from taskflow.core.exceptions import DomainException, domain_exception_handler
+from taskflow.core.exceptions import (
+    DomainException,
+    domain_exception_handler,
+    validation_exception_handler,
+)
 
 
 def create_app() -> FastAPI:
@@ -39,6 +44,7 @@ def create_app() -> FastAPI:
 
     # Exception Handlers
     app.add_exception_handler(DomainException, domain_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
     # Mount API routers
     app.include_router(api_v1_router, prefix=settings.API_V1_STR)

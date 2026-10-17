@@ -1,9 +1,11 @@
 from fastapi import APIRouter
 
+from taskflow.api.v1.endpoints.auth import router as auth_router
 from taskflow.api.v1.endpoints.health import HealthResponse
 from taskflow.core.config import settings
 
 router = APIRouter()
+router.include_router(auth_router)
 
 
 @router.get("/health", response_model=HealthResponse, tags=["System"])

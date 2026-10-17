@@ -37,3 +37,25 @@ async def domain_exception_handler(request: Request, exc: Exception) -> JSONResp
             }
         },
     )
+
+
+async def validation_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", "req_unknown")
+    errors = getattr(exc, "errors", lambda: str(exc))()
+    return JSONResponse(
+        status_code=getattr(
+            status,
+            "HTTP_422_UNPROCESSABLE_CONTENT",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        ),
+        content={
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed",
+                "details": {"errors": errors},
+                "request_id": request_id,
+            }
+        },
+    )

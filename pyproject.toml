@@ -34,6 +34,7 @@ dev = [
     "mypy>=1.12.0",
     "pre-commit>=3.8.0",
     "pip-audit>=2.7.3",
+    "aiosqlite>=0.20.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -82,6 +83,7 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 
 [tool.pytest.ini_options]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
