@@ -46,7 +46,7 @@ Standard Error Codes:
 ### 1. User Registration
 `POST /api/v1/auth/register`
 
-Creates a new user, hashes password with Argon2id, generates a database-backed session, and returns auth response with session cookies.
+Creates a new user and hashes password with Argon2id. Registration does not create an active session, does not issue cookies, and does not automatically log the user in. The client redirects the user to the login endpoint to authenticate.
 
 **Request Headers**:
 - `Content-Type: application/json`
@@ -65,9 +65,7 @@ Creates a new user, hashes password with Argon2id, generates a database-backed s
 - `full_name`: String, min 1 character, max 255 characters.
 
 **Success Response**: `201 Created`
-- **Cookies Set**:
-  - `taskflow_session`: `<session_token>` (`HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`)
-  - `taskflow_csrf`: `<csrf_token>` (`Path=/; SameSite=Lax; Max-Age=604800`)
+- **Cookies Set**: None
 - **Response Body**:
 ```json
 {
@@ -80,7 +78,6 @@ Creates a new user, hashes password with Argon2id, generates a database-backed s
     "created_at": "2026-10-17T07:30:00Z",
     "updated_at": "2026-10-17T07:30:00Z"
   },
-  "csrf_token": "a1b2c3d4e5f60718...",
   "message": "User registered successfully"
 }
 ```

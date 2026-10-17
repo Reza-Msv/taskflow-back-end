@@ -15,6 +15,7 @@ from taskflow.domains.identity.schemas import (
     LoginRequest,
     MessageResponse,
     RegisterRequest,
+    RegisterResponse,
     UserResponse,
 )
 from taskflow.domains.identity.service import AuthService
@@ -64,35 +65,23 @@ def _clear_auth_cookies(response: Response) -> None:
 
 @router.post(
     "/register",
-    response_model=AuthResponse,
+    response_model=RegisterResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Register new user account",
     description=(
-        "Registers a new user, hashes password with Argon2id, issues a new session, "
-        "and sets HttpOnly session and CSRF cookies."
+        "Registers a new user and hashes password with Argon2id. "
+        "Does not create an authenticated session or set authentication cookies."
     ),
 )
 async def register(
-    request: Request,
-    response: Response,
     payload: RegisterRequest,
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
-) -> AuthResponse:
-    """Handle new user registration and issue authenticated session."""
-    client_ip = request.client.host if request.client else None
-    user_agent = request.headers.get("User-Agent")
+) -> RegisterResponse:
+    """Handle new user registration without logging the user in."""
+    user = await auth_service.register(request=payload)
 
-    user, session_token, csrf_token = await auth_service.register(
-        request=payload,
-        ip_address=client_ip,
-        user_agent=user_agent,
-    )
-
-    _set_auth_cookies(response, session_token, csrf_token)
-
-    return AuthResponse(
+    return RegisterResponse(
         user=UserResponse.model_validate(user),
-        csrf_token=csrf_token,
         message="User registered successfully",
     )
 

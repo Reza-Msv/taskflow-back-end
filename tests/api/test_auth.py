@@ -12,7 +12,7 @@ from taskflow.domains.identity.service import hash_token
 
 @pytest.mark.asyncio
 async def test_register_success(async_client: AsyncClient):
-    """Test successful user registration issues cookies and returns user DTO."""
+    """Test successful user registration returns user DTO and does not issue cookies."""
     payload = {
         "email": "alice@example.com",
         "password": "Password123!",
@@ -27,12 +27,58 @@ async def test_register_success(async_client: AsyncClient):
     assert data["user"]["full_name"] == "Alice Smith"
     assert data["user"]["is_active"] is True
     assert "id" in data["user"]
-    assert "csrf_token" in data
-    assert len(data["csrf_token"]) > 0
+    assert "csrf_token" not in data
 
-    # Verify cookies
-    assert settings.SESSION_COOKIE_NAME in response.cookies
-    assert settings.CSRF_COOKIE_NAME in response.cookies
+    # Verify no authentication cookies are set
+    assert settings.SESSION_COOKIE_NAME not in response.cookies
+    assert settings.CSRF_COOKIE_NAME not in response.cookies
+
+
+@pytest.mark.asyncio
+async def test_registration_does_not_grant_access(
+    async_client: AsyncClient, db_session: AsyncSession
+):
+    """Verify registration does not create sessions or grant access."""
+    reg_payload = {
+        "email": "unauthenticated_reg@example.com",
+        "password": "Password123!",
+        "full_name": "Unauth Reg",
+    }
+    reg_resp = await async_client.post("/api/v1/auth/register", json=reg_payload)
+    assert reg_resp.status_code == 201
+    user_id = reg_resp.json()["user"]["id"]
+
+    # 1. Protected endpoint /api/v1/auth/me rejects immediately
+    me_resp = await async_client.get("/api/v1/auth/me")
+    assert me_resp.status_code == 401
+    assert me_resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+    # 2. Verify no active session row was created in database
+    import uuid
+
+    stmt = select(Session).where(Session.user_id == uuid.UUID(user_id))
+    result = await db_session.execute(stmt)
+    assert result.scalars().first() is None
+
+    # 3. User can log in to obtain session
+    login_resp = await async_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "unauthenticated_reg@example.com",
+            "password": "Password123!",
+        },
+    )
+    assert login_resp.status_code == 200
+    assert settings.SESSION_COOKIE_NAME in login_resp.cookies
+    session_cookie = login_resp.cookies[settings.SESSION_COOKIE_NAME]
+
+    # 4. Now /api/v1/auth/me succeeds with the login session cookie
+    authed_me_resp = await async_client.get(
+        "/api/v1/auth/me",
+        cookies={settings.SESSION_COOKIE_NAME: session_cookie},
+    )
+    assert authed_me_resp.status_code == 200
+    assert authed_me_resp.json()["email"] == "unauthenticated_reg@example.com"
 
 
 @pytest.mark.asyncio
@@ -189,7 +235,7 @@ async def test_get_current_user_unauthenticated(async_client: AsyncClient):
 @pytest.mark.asyncio
 async def test_get_current_user_with_cookie(async_client: AsyncClient):
     """Test /api/v1/auth/me succeeds with session cookie."""
-    reg_resp = await async_client.post(
+    await async_client.post(
         "/api/v1/auth/register",
         json={
             "email": "david@example.com",
@@ -197,7 +243,11 @@ async def test_get_current_user_with_cookie(async_client: AsyncClient):
             "full_name": "David Miller",
         },
     )
-    session_cookie = reg_resp.cookies[settings.SESSION_COOKIE_NAME]
+    login_resp = await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "david@example.com", "password": "Password123!"},
+    )
+    session_cookie = login_resp.cookies[settings.SESSION_COOKIE_NAME]
 
     response = await async_client.get(
         "/api/v1/auth/me",
@@ -212,7 +262,7 @@ async def test_get_current_user_with_cookie(async_client: AsyncClient):
 @pytest.mark.asyncio
 async def test_get_current_user_with_bearer(async_client: AsyncClient):
     """Test /api/v1/auth/me succeeds with Bearer token header."""
-    reg_resp = await async_client.post(
+    await async_client.post(
         "/api/v1/auth/register",
         json={
             "email": "eva@example.com",
@@ -220,7 +270,11 @@ async def test_get_current_user_with_bearer(async_client: AsyncClient):
             "full_name": "Eva Green",
         },
     )
-    session_token = reg_resp.cookies[settings.SESSION_COOKIE_NAME]
+    login_resp = await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "eva@example.com", "password": "Password123!"},
+    )
+    session_token = login_resp.cookies[settings.SESSION_COOKIE_NAME]
 
     response = await async_client.get(
         "/api/v1/auth/me",
@@ -236,7 +290,7 @@ async def test_get_current_user_expired_session(
     async_client: AsyncClient, db_session: AsyncSession
 ):
     """Test expired session returns 401."""
-    reg_resp = await async_client.post(
+    await async_client.post(
         "/api/v1/auth/register",
         json={
             "email": "expired@example.com",
@@ -244,7 +298,11 @@ async def test_get_current_user_expired_session(
             "full_name": "Expired User",
         },
     )
-    session_cookie = reg_resp.cookies[settings.SESSION_COOKIE_NAME]
+    login_resp = await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "expired@example.com", "password": "Password123!"},
+    )
+    session_cookie = login_resp.cookies[settings.SESSION_COOKIE_NAME]
 
     # Expire session in test DB
     token_digest = hash_token(session_cookie)
@@ -265,7 +323,7 @@ async def test_get_current_user_expired_session(
 @pytest.mark.asyncio
 async def test_logout_with_csrf_protection(async_client: AsyncClient):
     """Test logout requires CSRF header when authenticated via cookie."""
-    reg_resp = await async_client.post(
+    await async_client.post(
         "/api/v1/auth/register",
         json={
             "email": "frank@example.com",
@@ -273,8 +331,12 @@ async def test_logout_with_csrf_protection(async_client: AsyncClient):
             "full_name": "Frank White",
         },
     )
-    session_cookie = reg_resp.cookies[settings.SESSION_COOKIE_NAME]
-    csrf_token = reg_resp.json()["csrf_token"]
+    login_resp = await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "frank@example.com", "password": "Password123!"},
+    )
+    session_cookie = login_resp.cookies[settings.SESSION_COOKIE_NAME]
+    csrf_token = login_resp.json()["csrf_token"]
 
     # 1. Attempt logout without CSRF header (should be rejected with 403)
     resp_no_csrf = await async_client.post(
@@ -304,7 +366,7 @@ async def test_logout_with_csrf_protection(async_client: AsyncClient):
 @pytest.mark.asyncio
 async def test_logout_with_bearer_token(async_client: AsyncClient):
     """Test logout succeeds with Bearer token without needing CSRF header."""
-    reg_resp = await async_client.post(
+    await async_client.post(
         "/api/v1/auth/register",
         json={
             "email": "grace@example.com",
@@ -312,7 +374,11 @@ async def test_logout_with_bearer_token(async_client: AsyncClient):
             "full_name": "Grace Hopper",
         },
     )
-    session_token = reg_resp.cookies[settings.SESSION_COOKIE_NAME]
+    login_resp = await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "grace@example.com", "password": "Password123!"},
+    )
+    session_token = login_resp.cookies[settings.SESSION_COOKIE_NAME]
 
     logout_resp = await async_client.post(
         "/api/v1/auth/logout",

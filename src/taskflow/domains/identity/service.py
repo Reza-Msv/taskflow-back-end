@@ -29,10 +29,8 @@ class AuthService:
     async def register(
         self,
         request: RegisterRequest,
-        ip_address: str | None = None,
-        user_agent: str | None = None,
-    ) -> tuple[User, str, str]:
-        """Register a user, store hashed credentials, and issue an active session."""
+    ) -> User:
+        """Register a user and store hashed credentials without issuing a session."""
         if not settings.ENABLE_PUBLIC_REGISTRATION:
             raise DomainException(
                 code="REGISTRATION_DISABLED",
@@ -62,28 +60,11 @@ class AuthService:
             password_hash=pwd_hash,
         )
 
-        # Create authentication session
-        raw_token = secrets.token_urlsafe(32)
-        csrf_token = secrets.token_hex(32)
-        token_digest = hash_token(raw_token)
-        expires_at = datetime.now(UTC) + timedelta(
-            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
-        )
-
-        await self.session_repo.create_session(
-            user_id=user.id,
-            token_hash=token_digest,
-            csrf_token=csrf_token,
-            expires_at=expires_at,
-            user_agent=user_agent,
-            ip_address=ip_address,
-        )
-
         # Service-level transaction boundary commit
         await self.session.commit()
         await self.session.refresh(user)
 
-        return user, raw_token, csrf_token
+        return user
 
     async def login(
         self,

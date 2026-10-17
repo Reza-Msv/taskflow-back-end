@@ -59,8 +59,18 @@ class UserResponse(BaseModel):
     updated_at: datetime = Field(..., description="Account last update timestamp (UTC)")
 
 
+class RegisterResponse(BaseModel):
+    """Response returned upon successful user registration."""
+
+    user: UserResponse = Field(..., description="Registered user profile")
+    message: str = Field(
+        default="User registered successfully",
+        description="Human-readable status message",
+    )
+
+
 class AuthResponse(BaseModel):
-    """Response returned upon successful authentication or registration."""
+    """Response returned upon successful authentication."""
 
     user: UserResponse = Field(..., description="Authenticated user profile")
     csrf_token: str = Field(
