@@ -87,3 +87,31 @@ class MessageResponse(BaseModel):
     """Generic status message response."""
 
     message: str = Field(..., description="Status message")
+
+
+class UserUpdateAdminRequest(BaseModel):
+    """Payload for updating user profile or status by admin."""
+
+    full_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="Updated display name",
+    )
+    is_active: bool | None = Field(
+        default=None,
+        description="Account active status flag",
+    )
+    is_superuser: bool | None = Field(
+        default=None,
+        description="Superuser privileges flag",
+    )
+
+
+class UserListResponse(BaseModel):
+    """Paginated list of user profiles."""
+
+    items: list[UserResponse] = Field(..., description="List of user profiles")
+    page: int = Field(..., description="Current page number (1-indexed)")
+    page_size: int = Field(..., description="Number of items per page")
+    total: int = Field(..., description="Total number of users matching criteria")

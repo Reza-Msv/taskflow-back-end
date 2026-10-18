@@ -52,6 +52,74 @@ class UserRepository:
         await self.session.flush()
         return user
 
+    async def list_users(
+        self,
+        skip: int = 0,
+        limit: int = 25,
+        search: str | None = None,
+        is_active: bool | None = None,
+        is_superuser: bool | None = None,
+    ) -> list[User]:
+        """List users with pagination, optional text search, and status filters."""
+        stmt = select(User).order_by(User.created_at.desc())
+
+        if search:
+            search_pattern = f"%{search.strip()}%"
+            stmt = stmt.where(
+                (User.email.ilike(search_pattern))
+                | (User.full_name.ilike(search_pattern))
+            )
+        if is_active is not None:
+            stmt = stmt.where(User.is_active == is_active)
+        if is_superuser is not None:
+            stmt = stmt.where(User.is_superuser == is_superuser)
+
+        stmt = stmt.offset(skip).limit(limit)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_users(
+        self,
+        search: str | None = None,
+        is_active: bool | None = None,
+        is_superuser: bool | None = None,
+    ) -> int:
+        """Count total matching users."""
+        from sqlalchemy import func
+
+        stmt = select(func.count(User.id))
+        if search:
+            search_pattern = f"%{search.strip()}%"
+            stmt = stmt.where(
+                (User.email.ilike(search_pattern))
+                | (User.full_name.ilike(search_pattern))
+            )
+        if is_active is not None:
+            stmt = stmt.where(User.is_active == is_active)
+        if is_superuser is not None:
+            stmt = stmt.where(User.is_superuser == is_superuser)
+
+        result = await self.session.execute(stmt)
+        return int(result.scalar_one() or 0)
+
+    async def update_user(
+        self,
+        user: User,
+        full_name: str | None = None,
+        is_active: bool | None = None,
+        is_superuser: bool | None = None,
+    ) -> User:
+        """Update user mutable fields."""
+        if full_name is not None:
+            user.full_name = full_name.strip()
+        if is_active is not None:
+            user.is_active = is_active
+        if is_superuser is not None:
+            user.is_superuser = is_superuser
+
+        await self.session.flush()
+        return user
+
     async def create_credentials(
         self,
         user_id: uuid.UUID,

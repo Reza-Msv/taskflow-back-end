@@ -1,5 +1,5 @@
 from collections.abc import AsyncGenerator
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends, Header, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +9,9 @@ from taskflow.core.exceptions import DomainException
 from taskflow.db.session import get_db_session
 from taskflow.domains.identity.models import Session, User
 from taskflow.domains.identity.service import AuthService
+
+if TYPE_CHECKING:
+    from taskflow.domains.organizations.service import OrganizationService
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -22,6 +25,15 @@ def get_auth_service(
 ) -> AuthService:
     """Dependency injecting AuthService with active DB session."""
     return AuthService(session)
+
+
+def get_organization_service(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> "OrganizationService":
+    """Dependency injecting OrganizationService with active DB session."""
+    from taskflow.domains.organizations.service import OrganizationService
+
+    return OrganizationService(session)
 
 
 class SessionCredentials:
@@ -115,3 +127,16 @@ async def get_current_active_user(
             status_code=status.HTTP_403_FORBIDDEN,
         )
     return user
+
+
+async def require_superuser(
+    current_user: Annotated[User, Depends(get_current_active_user)],
+) -> User:
+    """Dependency ensuring that the current active user has administrator privileges."""
+    if not current_user.is_superuser:
+        raise DomainException(
+            code="FORBIDDEN",
+            message="Administrator privileges required.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    return current_user

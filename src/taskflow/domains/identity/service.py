@@ -1,5 +1,6 @@
 import hashlib
 import secrets
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import status
@@ -10,7 +11,11 @@ from taskflow.core.exceptions import DomainException
 from taskflow.core.security import hash_password, verify_password
 from taskflow.domains.identity.models import Session, User
 from taskflow.domains.identity.repository import SessionRepository, UserRepository
-from taskflow.domains.identity.schemas import LoginRequest, RegisterRequest
+from taskflow.domains.identity.schemas import (
+    LoginRequest,
+    RegisterRequest,
+    UserUpdateAdminRequest,
+)
 
 
 def hash_token(raw_token: str) -> str:
@@ -157,3 +162,81 @@ class AuthService:
             )
 
         return db_session.user, db_session
+
+    async def list_users(
+        self,
+        page: int = 1,
+        page_size: int = 25,
+        search: str | None = None,
+        is_active: bool | None = None,
+        is_superuser: bool | None = None,
+    ) -> tuple[list[User], int]:
+        """List users with pagination and filters."""
+        skip = (page - 1) * page_size
+        users = await self.user_repo.list_users(
+            skip=skip,
+            limit=page_size,
+            search=search,
+            is_active=is_active,
+            is_superuser=is_superuser,
+        )
+        total = await self.user_repo.count_users(
+            search=search,
+            is_active=is_active,
+            is_superuser=is_superuser,
+        )
+        return users, total
+
+    async def get_user_by_id(self, user_id: uuid.UUID) -> User:
+        """Fetch user by ID or raise USER_NOT_FOUND."""
+        user = await self.user_repo.get_by_id(user_id)
+        if user is None:
+            raise DomainException(
+                code="USER_NOT_FOUND",
+                message="User not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"user_id": str(user_id)},
+            )
+        return user
+
+    async def update_user_by_admin(
+        self,
+        user_id: uuid.UUID,
+        request: "UserUpdateAdminRequest",
+        current_admin_id: uuid.UUID,
+    ) -> User:
+        """Admin updating user details, activation status, or admin privileges."""
+        user = await self.get_user_by_id(user_id)
+
+        # Prevent admin from deactivating or revoking superuser privileges from self
+        if user.id == current_admin_id:
+            if request.is_active is False:
+                raise DomainException(
+                    code="CANNOT_DEACTIVATE_SELF",
+                    message="Administrators cannot deactivate their own account.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                )
+            if request.is_superuser is False:
+                raise DomainException(
+                    code="CANNOT_DEMOTE_SELF",
+                    message=(
+                        "Administrators cannot revoke their own superuser privileges."
+                    ),
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # Update user
+        updated_user = await self.user_repo.update_user(
+            user=user,
+            full_name=request.full_name,
+            is_active=request.is_active,
+            is_superuser=request.is_superuser,
+        )
+
+        # If deactivated, revoke all active sessions to immediately terminate access
+        if request.is_active is False:
+            await self.session_repo.delete_all_user_sessions(user.id)
+
+        await self.session.commit()
+        await self.session.refresh(updated_user)
+        return updated_user
