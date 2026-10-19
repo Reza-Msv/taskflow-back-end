@@ -12,6 +12,8 @@ from taskflow.domains.identity.service import AuthService
 
 if TYPE_CHECKING:
     from taskflow.domains.organizations.service import OrganizationService
+    from taskflow.domains.work_items.service import DashboardService
+
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -34,6 +36,15 @@ def get_organization_service(
     from taskflow.domains.organizations.service import OrganizationService
 
     return OrganizationService(session)
+
+
+def get_dashboard_service(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> "DashboardService":
+    """Dependency injecting DashboardService with active DB session."""
+    from taskflow.domains.work_items.service import DashboardService
+
+    return DashboardService(session)
 
 
 class SessionCredentials:
