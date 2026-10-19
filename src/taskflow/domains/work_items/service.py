@@ -2,23 +2,37 @@ import math
 import uuid
 from datetime import UTC, datetime
 
+from fastapi import status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from taskflow.core.exceptions import DomainException
+from taskflow.domains.identity.repository import UserRepository
+from taskflow.domains.organizations.repository import OrganizationRepository
+from taskflow.domains.projects.repository import ProjectRepository
 from taskflow.domains.work_items.models import WorkItem
 from taskflow.domains.work_items.repository import (
     COMPLETED_STATUSES,
     DashboardRepository,
+    WorkItemRepository,
 )
 from taskflow.domains.work_items.schemas import (
     DashboardSummaryResponse,
+    KanbanBoardResponse,
+    KanbanColumn,
     OverdueUpcomingTasksResponse,
     ProjectBrief,
     ProjectSummary,
+    TaskStatusMoveRequest,
     UserActivityActor,
     UserActivityItem,
     UserActivityListResponse,
+    WorkflowStatusResponse,
+    WorkItemActivityResponse,
+    WorkItemCreateRequest,
     WorkItemDashboardItem,
     WorkItemListDashboardResponse,
+    WorkItemResponse,
+    WorkItemUpdateRequest,
 )
 
 
@@ -227,3 +241,429 @@ class DashboardService:
             page_size=page_size,
             total_pages=total_pages,
         )
+
+
+class TaskService:
+    """
+    Business service managing task CRUD, assignment, Kanban workflows,
+    status transitions, and activity history.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.work_item_repo = WorkItemRepository(session)
+        self.project_repo = ProjectRepository(session)
+        self.org_repo = OrganizationRepository(session)
+        self.user_repo = UserRepository(session)
+
+    async def get_task_by_id(
+        self,
+        task_id: uuid.UUID,
+        project_id: uuid.UUID | None = None,
+    ) -> WorkItem:
+        """Fetch task or raise TASK_NOT_FOUND."""
+        task = await self.work_item_repo.get_by_id(task_id, project_id=project_id)
+        if task is None:
+            raise DomainException(
+                code="TASK_NOT_FOUND",
+                message="Task not found or inaccessible.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"task_id": str(task_id)},
+            )
+        return task
+
+    async def list_tasks(
+        self,
+        project_id: uuid.UUID,
+        status: str | None = None,
+        assignee_id: uuid.UUID | None = None,
+        priority: str | None = None,
+        search: str | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[WorkItem], int]:
+        """List tasks for a project with pagination and filters."""
+        skip = (page - 1) * page_size
+        return await self.work_item_repo.list_work_items(
+            project_id=project_id,
+            status=status,
+            assignee_id=assignee_id,
+            priority=priority,
+            search=search,
+            skip=skip,
+            limit=page_size,
+        )
+
+    async def create_task(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        creator_id: uuid.UUID,
+        request: WorkItemCreateRequest,
+    ) -> WorkItem:
+        """
+        Create a new task, allocate next gapless sequence issue key,
+        validate assignee and status, and record creation activity.
+        """
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Validate assignee belongs to organization
+        if request.assignee_id is not None:
+            org_member = await self.org_repo.get_membership(org_id, request.assignee_id)
+            if org_member is None or not org_member.is_active:
+                raise DomainException(
+                    code="INVALID_ASSIGNEE",
+                    message="Assignee must be an active member of the organization.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    details={"assignee_id": str(request.assignee_id)},
+                )
+
+        # Ensure default statuses exist for project
+        await self.work_item_repo.ensure_default_workflow_statuses(project_id)
+
+        # Resolve initial status
+        initial_status = "todo"
+        if request.status:
+            status_obj = await self.work_item_repo.get_status_by_name_or_id(
+                project_id, request.status
+            )
+            if status_obj is None:
+                raise DomainException(
+                    code="INVALID_STATUS",
+                    message=f"Status '{request.status}' is not configured for this project.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    details={"status": request.status},
+                )
+            initial_status = status_obj.category.lower() if status_obj.category else status_obj.name.lower().replace(" ", "_")
+        else:
+            # Check default status
+            project_statuses = await self.work_item_repo.get_project_statuses(project_id)
+            default_st = next((s for s in project_statuses if s.is_default), None)
+            if default_st:
+                initial_status = default_st.category.lower() if default_st.category else default_st.name.lower().replace(" ", "_")
+
+        # Atomically increment issue sequence counter
+        seq_num, issue_key = await self.work_item_repo.get_next_sequence_and_issue_key(
+            project_id=project.id,
+            project_key=project.key,
+        )
+
+        rank_val = request.rank or f"0|{seq_num:06d}:"
+
+        task = await self.work_item_repo.create_work_item(
+            project_id=project_id,
+            organization_id=org_id,
+            sequence_number=seq_num,
+            issue_key=issue_key,
+            title=request.title,
+            description=request.description,
+            type=request.type,
+            priority=request.priority,
+            status=initial_status,
+            reporter_id=creator_id,
+            assignee_id=request.assignee_id,
+            parent_id=request.parent_id,
+            due_date=request.due_date,
+            estimated_points=request.estimated_points,
+            rank=rank_val,
+        )
+
+        # Audit creation event in same transaction
+        await self.work_item_repo.record_activity(
+            work_item_id=task.id,
+            user_id=creator_id,
+            field="created",
+            old_value=None,
+            new_value=f"Created task {issue_key}",
+        )
+
+        await self.session.commit()
+        await self.session.refresh(task)
+        return task
+
+    async def update_task(
+        self,
+        task_id: uuid.UUID,
+        project_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        request: WorkItemUpdateRequest,
+    ) -> WorkItem:
+        """
+        Update task fields with optimistic concurrency control,
+        assignee validation, and granular audit history.
+        """
+        task = await self.get_task_by_id(task_id, project_id=project_id)
+
+        # Optimistic concurrency check
+        if request.version is not None and task.version != request.version:
+            raise DomainException(
+                code="STALE_OBJECT_ERROR",
+                message="The task has been modified by another transaction. Please reload.",
+                status_code=status.HTTP_409_CONFLICT,
+                details={"current_version": task.version, "provided_version": request.version},
+            )
+
+        # Validate new assignee
+        if request.assignee_id is not None and request.assignee_id != task.assignee_id:
+            org_member = await self.org_repo.get_membership(
+                task.organization_id, request.assignee_id
+            )
+            if org_member is None or not org_member.is_active:
+                raise DomainException(
+                    code="INVALID_ASSIGNEE",
+                    message="Assignee must be an active member of the organization.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    details={"assignee_id": str(request.assignee_id)},
+                )
+
+        mutated = False
+
+        if request.title is not None and request.title.strip() != task.title:
+            await self.work_item_repo.record_activity(
+                task.id, actor_id, "title", task.title, request.title.strip()
+            )
+            task.title = request.title.strip()
+            mutated = True
+
+        if request.description is not None and request.description.strip() != (task.description or ""):
+            await self.work_item_repo.record_activity(
+                task.id, actor_id, "description", task.description, request.description.strip()
+            )
+            task.description = request.description.strip()
+            mutated = True
+
+        if request.priority is not None and request.priority != task.priority:
+            await self.work_item_repo.record_activity(
+                task.id, actor_id, "priority", task.priority, request.priority
+            )
+            task.priority = request.priority
+            mutated = True
+
+        if request.assignee_id is not None and request.assignee_id != task.assignee_id:
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "assignee_id",
+                str(task.assignee_id) if task.assignee_id else None,
+                str(request.assignee_id),
+            )
+            task.assignee_id = request.assignee_id
+            mutated = True
+
+        if request.parent_id is not None and request.parent_id != task.parent_id:
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "parent_id",
+                str(task.parent_id) if task.parent_id else None,
+                str(request.parent_id),
+            )
+            task.parent_id = request.parent_id
+            mutated = True
+
+        if request.due_date is not None and request.due_date != task.due_date:
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "due_date",
+                task.due_date.isoformat() if task.due_date else None,
+                request.due_date.isoformat(),
+            )
+            task.due_date = request.due_date
+            mutated = True
+
+        if request.estimated_points is not None and request.estimated_points != task.estimated_points:
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "estimated_points",
+                str(task.estimated_points) if task.estimated_points is not None else None,
+                str(request.estimated_points),
+            )
+            task.estimated_points = request.estimated_points
+            mutated = True
+
+        if mutated:
+            task.version += 1
+            await self.session.commit()
+            await self.session.refresh(task)
+
+        return task
+
+    async def move_task_status(
+        self,
+        task_id: uuid.UUID,
+        project_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        request: TaskStatusMoveRequest,
+    ) -> WorkItem:
+        """
+        Transition task to a new status and/or update its column rank.
+        Validates configured workflow transitions when defined.
+        """
+        task = await self.get_task_by_id(task_id, project_id=project_id)
+
+        # Optimistic concurrency check
+        if request.version is not None and task.version != request.version:
+            raise DomainException(
+                code="STALE_OBJECT_ERROR",
+                message="The task has been modified by another transaction. Please reload.",
+                status_code=status.HTTP_409_CONFLICT,
+                details={"current_version": task.version, "provided_version": request.version},
+            )
+
+        await self.work_item_repo.ensure_default_workflow_statuses(project_id)
+
+        target_status_obj = await self.work_item_repo.get_status_by_name_or_id(
+            project_id, request.status
+        )
+        if target_status_obj is None:
+            raise DomainException(
+                code="INVALID_STATUS",
+                message=f"Status '{request.status}' is not valid for this project.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={"status": request.status},
+            )
+
+        new_status_name = target_status_obj.category.lower() if target_status_obj.category else target_status_obj.name.lower().replace(" ", "_")
+
+        # Validate workflow transition policy if transitions are configured
+        if new_status_name != task.status:
+            current_status_obj = await self.work_item_repo.get_status_by_name_or_id(
+                project_id, task.status
+            )
+            has_transitions = await self.work_item_repo.has_configured_transitions(project_id)
+
+            if has_transitions and current_status_obj is not None:
+                allowed_transitions = await self.work_item_repo.get_allowed_transitions(
+                    current_status_obj.id
+                )
+                allowed_to_ids = {t.to_status_id for t in allowed_transitions}
+                if target_status_obj.id not in allowed_to_ids:
+                    raise DomainException(
+                        code="INVALID_STATUS_TRANSITION",
+                        message=f"Transition from '{task.status}' to '{request.status}' is not permitted by project workflow rules.",
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        details={
+                            "from_status": task.status,
+                            "to_status": request.status,
+                        },
+                    )
+
+            # Record status transition history
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "status",
+                task.status,
+                new_status_name,
+            )
+            task.status = new_status_name
+
+        if request.rank is not None and request.rank != task.rank:
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "rank",
+                task.rank,
+                request.rank,
+            )
+            task.rank = request.rank
+
+        task.version += 1
+        await self.session.commit()
+        await self.session.refresh(task)
+        return task
+
+    async def delete_task(
+        self,
+        task_id: uuid.UUID,
+        project_id: uuid.UUID,
+        actor_id: uuid.UUID,
+    ) -> None:
+        """Delete task and record activity."""
+        task = await self.get_task_by_id(task_id, project_id=project_id)
+        await self.work_item_repo.delete_work_item(task)
+        await self.session.commit()
+
+    async def get_kanban_board(
+        self,
+        project_id: uuid.UUID,
+    ) -> KanbanBoardResponse:
+        """
+        Retrieve project tasks grouped by workflow status columns in order.
+        """
+        # Ensure default statuses exist if project has none
+        statuses = await self.work_item_repo.ensure_default_workflow_statuses(project_id)
+        tasks = await self.work_item_repo.list_all_project_work_items(project_id)
+
+        # Group tasks by matching status name or category
+        columns: list[KanbanColumn] = []
+        task_dtos = [WorkItemResponse.model_validate(t) for t in tasks]
+
+        for st in statuses:
+            st_key = st.name.lower().replace(" ", "_")
+            col_tasks = [
+                t for t in task_dtos
+                if t.status.lower().replace(" ", "_") == st_key
+                or t.status.lower() == st.category.lower()
+            ]
+            columns.append(
+                KanbanColumn(
+                    status=WorkflowStatusResponse.model_validate(st),
+                    tasks=col_tasks,
+                    total_tasks=len(col_tasks),
+                )
+            )
+
+        return KanbanBoardResponse(
+            project_id=project_id,
+            columns=columns,
+            total_tasks=len(task_dtos),
+        )
+
+    async def get_task_history(
+        self,
+        task_id: uuid.UUID,
+        project_id: uuid.UUID,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[WorkItemActivityResponse], int]:
+        """Fetch paginated audit activity stream for a task."""
+        await self.get_task_by_id(task_id, project_id=project_id)
+        skip = (page - 1) * page_size
+        activities, total = await self.work_item_repo.list_activities_for_task(
+            work_item_id=task_id,
+            skip=skip,
+            limit=page_size,
+        )
+
+        results = []
+        for act in activities:
+            actor = None
+            if act.user:
+                actor = UserActivityActor(
+                    id=act.user.id,
+                    email=act.user.email,
+                    full_name=act.user.full_name,
+                )
+            results.append(
+                WorkItemActivityResponse(
+                    id=act.id,
+                    work_item_id=act.work_item_id,
+                    user_id=act.user_id,
+                    field=act.field,
+                    old_value=act.old_value,
+                    new_value=act.new_value,
+                    created_at=act.created_at,
+                    user=actor,
+                )
+            )
+
+        return results, total
