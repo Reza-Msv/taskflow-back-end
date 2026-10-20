@@ -10,6 +10,7 @@ from taskflow.db.base import Base, TimestampMixin, UUIDMixin
 
 if TYPE_CHECKING:
     from taskflow.domains.projects.models import Project
+    from taskflow.domains.work_items.models import WorkItem
 
 
 class Sprint(Base, UUIDMixin, TimestampMixin):
@@ -49,12 +50,15 @@ class Sprint(Base, UUIDMixin, TimestampMixin):
         nullable=True,
     )
 
-    __table_args__ = (
-        Index("ix_sprints_project_status", "project_id", "status"),
-    )
+    __table_args__ = (Index("ix_sprints_project_status", "project_id", "status"),)
 
     project: Mapped["Project"] = relationship(
         "Project",
+    )
+    work_items: Mapped[list["WorkItem"]] = relationship(
+        "WorkItem",
+        back_populates="sprint",
+        foreign_keys="WorkItem.sprint_id",
     )
     snapshots: Mapped[list["SprintSnapshot"]] = relationship(
         "SprintSnapshot",
