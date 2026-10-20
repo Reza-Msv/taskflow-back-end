@@ -3,7 +3,9 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import configure_mappers
 
+import taskflow.db.models  # noqa: F401
 from taskflow.api.v1.router import router as api_v1_router
 from taskflow.core.config import settings
 from taskflow.core.exceptions import (
@@ -15,6 +17,9 @@ from taskflow.core.exceptions import (
 
 def create_app() -> FastAPI:
     """FastAPI application factory."""
+    # Validate and configure all ORM mappers and cross-domain relationships at startup
+    configure_mappers()
+
     app = FastAPI(
         title=settings.PROJECT_NAME,
         version="0.1.0",

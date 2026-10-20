@@ -6,13 +6,8 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-# Import all domain models so that Base.metadata has the complete schema definition
-import taskflow.domains.collaboration.models  # noqa: F401
-import taskflow.domains.identity.models  # noqa: F401
-import taskflow.domains.organizations.models  # noqa: F401
-import taskflow.domains.projects.models  # noqa: F401
-import taskflow.domains.scrum.models  # noqa: F401
-import taskflow.domains.work_items.models  # noqa: F401
+# Import centralized models registry so that Base.metadata has the complete schema definition
+import taskflow.db.models  # noqa: F401
 from taskflow.core.config import settings
 from taskflow.db.base import Base
 
