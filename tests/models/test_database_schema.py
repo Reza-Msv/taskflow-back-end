@@ -29,6 +29,7 @@ from taskflow.domains.scrum.models import (
 from taskflow.domains.work_items.models import (
     Attachment,
     Label,
+    SavedFilter,
     WorkflowStatus,
     WorkflowTransition,
     WorkItem,
@@ -505,3 +506,54 @@ async def test_scrum_workflow_and_supporting_entities(
     assert loaded_sprint.retrospective.what_went_well == (
         "Delivered all high priority tasks"
     )
+
+
+@pytest.mark.asyncio
+async def test_saved_filter_persistence_and_cascades(
+    db_session: AsyncSession,
+):
+    """Verify SavedFilter model persistence, user relationship, and cascading."""
+    user = User(
+        email="filter_owner@taskflow.dev",
+        full_name="Filter Owner",
+    )
+    org = Organization(
+        name="Filter Org",
+        slug="filter-org-schema",
+    )
+    db_session.add_all([user, org])
+    await db_session.flush()
+
+    project = Project(
+        organization_id=org.id,
+        name="Filter Project",
+        key="FILT",
+        owner_id=user.id,
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    sf = SavedFilter(
+        user_id=user.id,
+        organization_id=org.id,
+        project_id=project.id,
+        name="Schema Test Filter",
+        description="Verify saved filter model mapping",
+        filter_criteria={"status": "todo", "priority": "high"},
+        sort_by="due_date",
+        sort_dir="asc",
+        view_type="list",
+        is_favorite=True,
+    )
+    db_session.add(sf)
+    await db_session.commit()
+
+    # Query back
+    stmt = select(SavedFilter).where(SavedFilter.id == sf.id)
+    res = await db_session.execute(stmt)
+    loaded = res.scalar_one()
+
+    assert loaded.name == "Schema Test Filter"
+    assert loaded.filter_criteria == {"status": "todo", "priority": "high"}
+    assert loaded.is_favorite is True
+    assert loaded.created_at is not None

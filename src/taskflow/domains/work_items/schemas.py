@@ -537,3 +537,154 @@ class WorkItemDetailResponse(WorkItemResponse):
     )
     attachments_count: int = Field(default=0, description="Total attachments count")
     comments_count: int = Field(default=0, description="Total comments count")
+
+
+# -------------------------------------------------------------
+# Phase 5: Search, Filters & Views Schemas
+# -------------------------------------------------------------
+
+
+class TaskFilterCriteria(BaseModel):
+    """Structured criteria for advanced task filtering."""
+
+    status: str | None = Field(default=None, description="Status name")
+    priority: str | None = Field(default=None, description="Priority level")
+    type: str | None = Field(default=None, description="Task type")
+    assignee_id: uuid.UUID | None = Field(default=None, description="Assignee user ID")
+    reporter_id: uuid.UUID | None = Field(default=None, description="Reporter user ID")
+    assigned_to_me: bool | None = Field(
+        default=None, description="Filter assigned to current user"
+    )
+    due_date_from: datetime | None = Field(
+        default=None, description="Due date start range"
+    )
+    due_date_to: datetime | None = Field(default=None, description="Due date end range")
+    is_overdue: bool | None = Field(default=None, description="Filter overdue tasks")
+    due_soon: bool | None = Field(
+        default=None, description="Filter tasks due in next 7 days"
+    )
+    is_completed: bool | None = Field(
+        default=None, description="Filter completed state"
+    )
+    label_id: uuid.UUID | None = Field(default=None, description="Taxonomic label ID")
+    search: str | None = Field(default=None, description="Text search term")
+
+
+class SavedFilterCreateRequest(BaseModel):
+    """Payload to create a persistent saved filter."""
+
+    name: str = Field(
+        ..., min_length=1, max_length=100, description="Saved filter name"
+    )
+    description: str | None = Field(
+        default=None, max_length=500, description="Description"
+    )
+    organization_id: uuid.UUID | None = Field(
+        default=None, description="Organization scope"
+    )
+    project_id: uuid.UUID | None = Field(default=None, description="Project scope")
+    filter_criteria: TaskFilterCriteria = Field(
+        default_factory=TaskFilterCriteria, description="Filter rules"
+    )
+    sort_by: str | None = Field(
+        default=None,
+        pattern="^(smart_order|due_date|priority|created_at|updated_at|title|rank)$",
+        description="Sort field",
+    )
+    sort_dir: str | None = Field(
+        default="asc",
+        pattern="^(asc|desc)$",
+        description="Sort direction",
+    )
+    view_type: str = Field(
+        default="list",
+        pattern="^(list|board|calendar)$",
+        description="View layout",
+    )
+    is_favorite: bool = Field(default=False, description="Pinned favorite status")
+
+
+class SavedFilterUpdateRequest(BaseModel):
+    """Payload to update an existing saved filter."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=500)
+    filter_criteria: TaskFilterCriteria | None = None
+    sort_by: str | None = Field(
+        default=None,
+        pattern="^(smart_order|due_date|priority|created_at|updated_at|title|rank)$",
+    )
+    sort_dir: str | None = Field(default=None, pattern="^(asc|desc)$")
+    view_type: str | None = Field(default=None, pattern="^(list|board|calendar)$")
+    is_favorite: bool | None = None
+
+
+class SavedFilterResponse(BaseModel):
+    """Saved filter entity representation."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    user_id: uuid.UUID
+    organization_id: uuid.UUID | None
+    project_id: uuid.UUID | None
+    name: str
+    description: str | None
+    filter_criteria: dict
+    sort_by: str | None
+    sort_dir: str | None
+    view_type: str
+    is_favorite: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class SavedFilterListResponse(BaseModel):
+    """List of saved filters."""
+
+    items: list[SavedFilterResponse]
+    total: int
+
+
+class SearchTaskResult(BaseModel):
+    """Global search match for task entity."""
+
+    id: uuid.UUID
+    issue_key: str
+    title: str
+    description: str | None
+    status: str
+    priority: str
+    type: str
+    project_id: uuid.UUID
+    project_name: str
+    project_key: str
+    organization_id: uuid.UUID
+    matched_field: str
+    entity_type: str = "task"
+
+
+class SearchProjectResult(BaseModel):
+    """Global search match for project entity."""
+
+    id: uuid.UUID
+    name: str
+    key: str
+    description: str | None
+    organization_id: uuid.UUID
+    is_private: bool
+    matched_field: str
+    entity_type: str = "project"
+
+
+class GlobalSearchResponse(BaseModel):
+    """Combined search results across tasks and projects."""
+
+    query: str
+    tasks: list[SearchTaskResult]
+    projects: list[SearchProjectResult]
+    total_tasks: int
+    total_projects: int
+    limit: int
+    offset: int
+

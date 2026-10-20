@@ -14,7 +14,11 @@ if TYPE_CHECKING:
     from taskflow.domains.collaboration.service import CollaborationService
     from taskflow.domains.organizations.service import OrganizationService
     from taskflow.domains.projects.service import ProjectService
-    from taskflow.domains.work_items.service import DashboardService, TaskService
+    from taskflow.domains.work_items.service import (
+        DashboardService,
+        SavedFilterService,
+        TaskService,
+    )
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -73,6 +77,15 @@ def get_collaboration_service(
     from taskflow.domains.collaboration.service import CollaborationService
 
     return CollaborationService(session)
+
+
+def get_saved_filter_service(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> "SavedFilterService":
+    """Dependency injecting SavedFilterService with active DB session."""
+    from taskflow.domains.work_items.service import SavedFilterService
+
+    return SavedFilterService(session)
 
 
 class SessionCredentials:
