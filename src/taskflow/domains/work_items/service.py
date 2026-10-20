@@ -8,6 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from taskflow.core.exceptions import DomainException
 from taskflow.domains.collaboration.repository import CollaborationRepository
+from taskflow.domains.collaboration.websocket import (
+    NotificationBroadcaster,
+    get_notification_broadcaster,
+)
 from taskflow.domains.identity.repository import UserRepository
 from taskflow.domains.organizations.repository import OrganizationRepository
 from taskflow.domains.projects.repository import ProjectRepository
@@ -260,13 +264,18 @@ class TaskService:
     status transitions, and activity history.
     """
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        broadcaster: NotificationBroadcaster | None = None,
+    ) -> None:
         self.session = session
         self.work_item_repo = WorkItemRepository(session)
         self.project_repo = ProjectRepository(session)
         self.org_repo = OrganizationRepository(session)
         self.user_repo = UserRepository(session)
         self.collab_repo = CollaborationRepository(session)
+        self.broadcaster = broadcaster or get_notification_broadcaster()
 
     async def get_task_by_id(
         self,
@@ -428,8 +437,9 @@ class TaskService:
         )
 
         # Notification on task assignment
+        assigned_notif = None
         if request.assignee_id is not None and request.assignee_id != creator_id:
-            await self.collab_repo.create_notification(
+            assigned_notif = await self.collab_repo.create_notification(
                 user_id=request.assignee_id,
                 actor_id=creator_id,
                 organization_id=org_id,
@@ -442,6 +452,38 @@ class TaskService:
 
         await self.session.commit()
         await self.session.refresh(task)
+
+        if assigned_notif:
+            await self.broadcaster.broadcast_to_user(
+                assigned_notif.user_id,
+                "notification_created",
+                {
+                    "id": str(assigned_notif.id),
+                    "user_id": str(assigned_notif.user_id),
+                    "actor_id": (
+                        str(assigned_notif.actor_id)
+                        if assigned_notif.actor_id
+                        else None
+                    ),
+                    "organization_id": (
+                        str(assigned_notif.organization_id)
+                        if assigned_notif.organization_id
+                        else None
+                    ),
+                    "type": assigned_notif.type,
+                    "title": assigned_notif.title,
+                    "message": assigned_notif.message,
+                    "resource_type": assigned_notif.resource_type,
+                    "resource_id": (
+                        str(assigned_notif.resource_id)
+                        if assigned_notif.resource_id
+                        else None
+                    ),
+                    "is_read": assigned_notif.is_read,
+                    "created_at": assigned_notif.created_at.isoformat(),
+                },
+            )
+
         return task
 
     async def update_task(
@@ -485,6 +527,7 @@ class TaskService:
                 )
 
         mutated = False
+        assigned_notif = None
 
         if request.title is not None and request.title.strip() != task.title:
             await self.work_item_repo.record_activity(
@@ -524,7 +567,7 @@ class TaskService:
             task.assignee_id = request.assignee_id
             mutated = True
             if request.assignee_id != actor_id:
-                await self.collab_repo.create_notification(
+                assigned_notif = await self.collab_repo.create_notification(
                     user_id=request.assignee_id,
                     actor_id=actor_id,
                     organization_id=task.organization_id,
@@ -617,6 +660,37 @@ class TaskService:
             await self.session.commit()
             await self.session.refresh(task)
 
+            if assigned_notif:
+                await self.broadcaster.broadcast_to_user(
+                    assigned_notif.user_id,
+                    "notification_created",
+                    {
+                        "id": str(assigned_notif.id),
+                        "user_id": str(assigned_notif.user_id),
+                        "actor_id": (
+                            str(assigned_notif.actor_id)
+                            if assigned_notif.actor_id
+                            else None
+                        ),
+                        "organization_id": (
+                            str(assigned_notif.organization_id)
+                            if assigned_notif.organization_id
+                            else None
+                        ),
+                        "type": assigned_notif.type,
+                        "title": assigned_notif.title,
+                        "message": assigned_notif.message,
+                        "resource_type": assigned_notif.resource_type,
+                        "resource_id": (
+                            str(assigned_notif.resource_id)
+                            if assigned_notif.resource_id
+                            else None
+                        ),
+                        "is_read": assigned_notif.is_read,
+                        "created_at": assigned_notif.created_at.isoformat(),
+                    },
+                )
+
         return task
 
     async def move_task_status(
@@ -703,8 +777,9 @@ class TaskService:
             )
             task.status = new_status_name
 
+            status_notif = None
             if task.assignee_id and task.assignee_id != actor_id:
-                await self.collab_repo.create_notification(
+                status_notif = await self.collab_repo.create_notification(
                     user_id=task.assignee_id,
                     actor_id=actor_id,
                     organization_id=task.organization_id,
@@ -728,6 +803,38 @@ class TaskService:
         task.version += 1
         await self.session.commit()
         await self.session.refresh(task)
+
+        if status_notif:
+            await self.broadcaster.broadcast_to_user(
+                status_notif.user_id,
+                "notification_created",
+                {
+                    "id": str(status_notif.id),
+                    "user_id": str(status_notif.user_id),
+                    "actor_id": (
+                        str(status_notif.actor_id)
+                        if status_notif.actor_id
+                        else None
+                    ),
+                    "organization_id": (
+                        str(status_notif.organization_id)
+                        if status_notif.organization_id
+                        else None
+                    ),
+                    "type": status_notif.type,
+                    "title": status_notif.title,
+                    "message": status_notif.message,
+                    "resource_type": status_notif.resource_type,
+                    "resource_id": (
+                        str(status_notif.resource_id)
+                        if status_notif.resource_id
+                        else None
+                    ),
+                    "is_read": status_notif.is_read,
+                    "created_at": status_notif.created_at.isoformat(),
+                },
+            )
+
         return task
 
     async def delete_task(

@@ -1,17 +1,32 @@
+import json
+import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from taskflow.api.deps import get_collaboration_service, get_current_active_user
+from taskflow.api.deps import (
+    authenticate_websocket,
+    get_collaboration_service,
+    get_current_active_user,
+    get_db,
+)
 from taskflow.domains.collaboration.schemas import (
     NotificationListResponse,
     NotificationResponse,
     NotificationUnreadCountResponse,
 )
 from taskflow.domains.collaboration.service import CollaborationService
+from taskflow.domains.collaboration.websocket import (
+    InMemoryConnectionManager,
+    get_notification_broadcaster,
+)
 from taskflow.domains.identity.models import User
 from taskflow.domains.identity.schemas import MessageResponse
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/notifications",
@@ -83,3 +98,54 @@ async def mark_all_notifications_read(
     """Mark all unread notifications as read for the authenticated user."""
     count = await collab_service.mark_all_notifications_read(user_id=current_user.id)
     return MessageResponse(message=f"Marked {count} notifications as read.")
+
+
+@router.websocket("/ws")
+async def websocket_notifications(
+    websocket: WebSocket,
+    session: Annotated[AsyncSession, Depends(get_db)],
+    broadcaster: Annotated[
+        InMemoryConnectionManager, Depends(get_notification_broadcaster)
+    ],
+) -> None:
+    """
+    Authenticated real-time WebSocket connection for user notifications.
+    Authenticates using session cookie or Authorization Bearer header.
+    Rejects unauthenticated connections with WS_1008_POLICY_VIOLATION.
+    """
+    user = await authenticate_websocket(websocket, session)
+    if user is None:
+        return
+
+    await broadcaster.connect(user.id, websocket)
+    try:
+        # Confirm connection with initial handshake event
+        await websocket.send_json(
+            {
+                "event": "connected",
+                "data": {
+                    "user_id": str(user.id),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                },
+            }
+        )
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+                if isinstance(msg, dict) and msg.get("event") == "ping":
+                    await websocket.send_json(
+                        {
+                            "event": "pong",
+                            "data": {"timestamp": datetime.now(UTC).isoformat()},
+                        }
+                    )
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        logger.debug("WebSocket client disconnected for user %s", user.id)
+    except Exception as exc:
+        logger.debug("WebSocket error for user %s: %s", user.id, exc)
+    finally:
+        await broadcaster.disconnect(user.id, websocket)
+

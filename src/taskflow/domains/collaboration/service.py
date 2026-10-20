@@ -1,5 +1,5 @@
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import status
 from sqlalchemy import select
@@ -34,18 +34,29 @@ if TYPE_CHECKING:
     pass
 
 
+from taskflow.domains.collaboration.websocket import (
+    NotificationBroadcaster,
+    get_notification_broadcaster,
+)
+
+
 class CollaborationService:
     """
     Business service orchestrating task comments, mentions, notifications,
     and mentionable member discovery.
     """
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        broadcaster: NotificationBroadcaster | None = None,
+    ) -> None:
         self.session = session
         self.collab_repo = CollaborationRepository(session)
         self.work_item_repo = WorkItemRepository(session)
         self.project_repo = ProjectRepository(session)
         self.org_repo = OrganizationRepository(session)
+        self.broadcaster = broadcaster or get_notification_broadcaster()
 
     @staticmethod
     def _to_user_brief(user: User | None) -> UserBrief | None:
@@ -259,11 +270,12 @@ class CollaborationService:
 
         # Dispatch notifications:
         # 1. Mention notifications (never notify the author themselves)
+        created_notifications: list[Notification] = []
         notified_users: set[uuid.UUID] = {actor_id}
         for uid in validated_mention_ids:
             if uid not in notified_users:
                 notified_users.add(uid)
-                await self.collab_repo.create_notification(
+                notif = await self.collab_repo.create_notification(
                     user_id=uid,
                     actor_id=actor_id,
                     organization_id=task.organization_id,
@@ -276,11 +288,12 @@ class CollaborationService:
                     resource_type="task",
                     resource_id=task.id,
                 )
+                created_notifications.append(notif)
 
         # 2. Notify assignee if not already notified
         if task.assignee_id and task.assignee_id not in notified_users:
             notified_users.add(task.assignee_id)
-            await self.collab_repo.create_notification(
+            notif = await self.collab_repo.create_notification(
                 user_id=task.assignee_id,
                 actor_id=actor_id,
                 organization_id=task.organization_id,
@@ -292,11 +305,12 @@ class CollaborationService:
                 resource_type="task",
                 resource_id=task.id,
             )
+            created_notifications.append(notif)
 
         # 3. Notify reporter if not already notified
         if task.reporter_id and task.reporter_id not in notified_users:
             notified_users.add(task.reporter_id)
-            await self.collab_repo.create_notification(
+            notif = await self.collab_repo.create_notification(
                 user_id=task.reporter_id,
                 actor_id=actor_id,
                 organization_id=task.organization_id,
@@ -308,8 +322,17 @@ class CollaborationService:
                 resource_type="task",
                 resource_id=task.id,
             )
+            created_notifications.append(notif)
 
         await self.session.commit()
+
+        # Real-time WebSocket broadcast after database persistence
+        for n in created_notifications:
+            await self.broadcaster.broadcast_to_user(
+                n.user_id,
+                "notification_created",
+                self._to_notification_payload(n),
+            )
 
         # Reload with relations
         reloaded = await self.collab_repo.get_comment_by_id(comment.id)
@@ -480,6 +503,24 @@ class CollaborationService:
             actor=self._to_user_brief(notif.actor),
         )
 
+    @staticmethod
+    def _to_notification_payload(notif: Notification) -> dict[str, Any]:
+        return {
+            "id": str(notif.id),
+            "user_id": str(notif.user_id),
+            "actor_id": str(notif.actor_id) if notif.actor_id else None,
+            "organization_id": (
+                str(notif.organization_id) if notif.organization_id else None
+            ),
+            "type": notif.type,
+            "title": notif.title,
+            "message": notif.message,
+            "resource_type": notif.resource_type,
+            "resource_id": str(notif.resource_id) if notif.resource_id else None,
+            "is_read": notif.is_read,
+            "created_at": notif.created_at.isoformat(),
+        }
+
     async def list_notifications(
         self,
         user_id: uuid.UUID,
@@ -526,10 +567,27 @@ class CollaborationService:
                 status_code=status.HTTP_404_NOT_FOUND,
             )
         await self.session.commit()
+        await self.broadcaster.broadcast_to_user(
+            user_id,
+            "notification_read",
+            {
+                "id": str(notification_id),
+                "user_id": str(user_id),
+                "is_read": True,
+            },
+        )
         return self._to_notification_response(notif)
 
     async def mark_all_notifications_read(self, user_id: uuid.UUID) -> int:
         """Mark all unread notifications as read for current user."""
         count = await self.collab_repo.mark_all_notifications_read(user_id)
         await self.session.commit()
+        await self.broadcaster.broadcast_to_user(
+            user_id,
+            "notifications_all_read",
+            {
+                "user_id": str(user_id),
+                "marked_count": count,
+            },
+        )
         return count

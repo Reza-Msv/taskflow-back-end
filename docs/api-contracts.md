@@ -350,4 +350,11 @@ Returns the comprehensive task detail representation (`WorkItemDetailResponse`) 
   - Marks notification as read.
 - `POST /api/v1/notifications/read-all`
   - Marks all unread notifications for current user as read.
+- `GET (WebSocket) /api/v1/notifications/ws` (Alias: `/api/v1/ws/notifications`)
+  - Authenticated WebSocket endpoint for real-time user notification streaming.
+  - Authenticates via HttpOnly `taskflow_session` cookie or `Authorization: Bearer <token>` handshake header. Never exposes tokens in URLs.
+  - Rejects unauthenticated connections with close code `1008`.
+  - Dispatches `connected`, `notification_created`, `notification_read`, `notifications_all_read`, and `pong`.
+  - See full specification in [websocket-notifications.md](file:///Users/reza/Desktop/Task-Flow/back-end/taskflow-back-end/docs/websocket-notifications.md).
+
 

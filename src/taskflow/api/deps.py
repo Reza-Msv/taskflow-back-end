@@ -1,7 +1,7 @@
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Annotated
 
-from fastapi import Depends, Header, Request, status
+from fastapi import Depends, Header, Request, WebSocket, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from taskflow.core.config import settings
@@ -179,3 +179,44 @@ async def require_superuser(
             status_code=status.HTTP_403_FORBIDDEN,
         )
     return current_user
+
+
+async def authenticate_websocket(
+    websocket: WebSocket,
+    session: AsyncSession,
+) -> User | None:
+    """
+    Authenticate a WebSocket connection using the session cookie or
+    Authorization header.
+    Closes the connection with WS_1008_POLICY_VIOLATION if credentials are
+    missing, invalid, expired, or belong to an inactive user.
+    """
+    raw_token: str | None = None
+    auth_header = websocket.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        raw_token = auth_header[7:].strip()
+
+    if not raw_token:
+        cookie_token = websocket.cookies.get(settings.SESSION_COOKIE_NAME)
+        if cookie_token:
+            raw_token = cookie_token.strip()
+
+    if not raw_token:
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="Authentication credentials were not provided.",
+        )
+        return None
+
+    auth_service = AuthService(session)
+    try:
+        user, _ = await auth_service.validate_session(raw_token)
+    except DomainException:
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="Invalid, expired, or inactive session.",
+        )
+        return None
+
+    return user
+
