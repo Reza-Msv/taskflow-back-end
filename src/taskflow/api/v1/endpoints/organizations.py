@@ -287,7 +287,9 @@ async def update_organization_member(
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
-    target_membership = await org_service.org_repo.get_membership(organization_id, user_id)
+    target_membership = await org_service.org_repo.get_membership(
+        organization_id, user_id
+    )
     if target_membership is None:
         raise DomainException(
             code="MEMBERSHIP_NOT_FOUND",
@@ -354,7 +356,9 @@ async def remove_organization_member(
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
-    target_membership = await org_service.org_repo.get_membership(organization_id, user_id)
+    target_membership = await org_service.org_repo.get_membership(
+        organization_id, user_id
+    )
     if target_membership is None:
         raise DomainException(
             code="MEMBERSHIP_NOT_FOUND",
@@ -362,7 +366,11 @@ async def remove_organization_member(
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
-    if not is_self and actor_membership.role == "admin" and target_membership.role == "owner":
+    if (
+        not is_self
+        and actor_membership.role == "admin"
+        and target_membership.role == "owner"
+    ):
         raise DomainException(
             code="FORBIDDEN",
             message="Admins cannot remove organization owners.",
@@ -451,9 +459,9 @@ async def list_organization_invitations(
     summary="Accept Organization Invitation",
 )
 async def accept_invitation(
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    org_service: Annotated[OrganizationService, Depends(get_organization_service)],
     token: str = Query(..., description="Invitation token"),
-    current_user: Annotated[User, Depends(get_current_active_user)] = None,
-    org_service: Annotated[OrganizationService, Depends(get_organization_service)] = None,
 ) -> OrganizationMembershipResponse:
     """Accept an organization invitation token for the current user."""
     membership = await org_service.accept_invitation(

@@ -34,6 +34,43 @@ class Settings(BaseSettings):
     ENABLE_PUBLIC_REGISTRATION: bool = True
     MAX_BULK_UPDATE_LIMIT: int = 50
 
+    # Attachment storage configuration
+    ATTACHMENT_STORAGE_DIR: str = "data/uploads"
+    ATTACHMENT_MAX_FILE_SIZE_BYTES: int = 20 * 1024 * 1024  # 20 MB
+    ATTACHMENT_ALLOWED_EXTENSIONS: list[str] = [
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".svg",
+        ".pdf",
+        ".txt",
+        ".csv",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".zip",
+    ]
+    ATTACHMENT_ALLOWED_CONTENT_TYPES: list[str] = [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+        "application/pdf",
+        "text/plain",
+        "text/csv",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/octet-stream",
+    ]
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

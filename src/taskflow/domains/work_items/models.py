@@ -308,6 +308,12 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
         back_populates="work_item",
         cascade="all, delete-orphan",
     )
+    checklists: Mapped[list["ChecklistItem"]] = relationship(
+        "ChecklistItem",
+        back_populates="work_item",
+        cascade="all, delete-orphan",
+        order_by="ChecklistItem.position",
+    )
 
 
 class WorkItemActivity(Base, UUIDMixin):
@@ -398,5 +404,46 @@ class Attachment(Base, UUIDMixin):
         back_populates="attachments",
     )
     uploader: Mapped["User | None"] = relationship(
+        "User",
+    )
+
+
+class ChecklistItem(Base, UUIDMixin, TimestampMixin):
+    """Checklist item under a work item with completion and ordering."""
+
+    __tablename__ = "checklist_items"
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("work_items.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    is_completed: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+    position: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    assignee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    work_item: Mapped["WorkItem"] = relationship(
+        "WorkItem",
+        back_populates="checklists",
+    )
+    assignee: Mapped["User | None"] = relationship(
         "User",
     )

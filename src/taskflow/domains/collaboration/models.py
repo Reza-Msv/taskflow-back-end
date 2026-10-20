@@ -1,7 +1,8 @@
 import uuid
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -44,6 +45,51 @@ class WorkItemComment(Base, UUIDMixin, TimestampMixin):
         back_populates="comments",
     )
     author: Mapped["User | None"] = relationship(
+        "User",
+    )
+    mentions: Mapped[list["CommentMention"]] = relationship(
+        "CommentMention",
+        back_populates="comment",
+        cascade="all, delete-orphan",
+    )
+
+
+class CommentMention(Base, UUIDMixin):
+    """Structured mention of a user in a task comment."""
+
+    __tablename__ = "comment_mentions"
+
+    comment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("work_item_comments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "comment_id",
+            "user_id",
+            name="uq_comment_mentions_comment_user",
+        ),
+    )
+
+    comment: Mapped["WorkItemComment"] = relationship(
+        "WorkItemComment",
+        back_populates="mentions",
+    )
+    user: Mapped["User"] = relationship(
         "User",
     )
 

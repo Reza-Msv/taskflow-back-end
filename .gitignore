@@ -14,3 +14,4 @@ build/
 *.egg-info/
 .env
 local_storage/
+data/

@@ -18,7 +18,7 @@ from taskflow.main import app
 
 # Isolated in-memory database strictly for automated testing to
 # guarantee zero mutation of real databases
-TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+TEST_DB_URL = "sqlite+aiosqlite:///file:testflow_memdb?mode=memory&cache=shared&uri=true"
 
 test_engine = create_async_engine(
     TEST_DB_URL,

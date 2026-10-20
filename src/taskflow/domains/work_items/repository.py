@@ -2,13 +2,16 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, delete, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from taskflow.domains.collaboration.models import WorkItemComment
 from taskflow.domains.organizations.models import OrganizationMembership
 from taskflow.domains.projects.models import Project, ProjectMembership, ProjectSequence
 from taskflow.domains.work_items.models import (
+    Attachment,
+    ChecklistItem,
     WorkflowStatus,
     WorkflowTransition,
     WorkItem,
@@ -467,7 +470,7 @@ class DashboardRepository:
 
 
 class WorkItemRepository:
-    """Persistence operations for WorkItem, WorkflowStatus, and WorkItemActivity entities."""
+    """Persistence operations for WorkItem, WorkflowStatus, and WorkItemActivity."""
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -568,7 +571,9 @@ class WorkItemRepository:
     ) -> tuple[list[WorkItem], int]:
         """List work items in a project with pagination and filters."""
         stmt = select(WorkItem).where(WorkItem.project_id == project_id)
-        count_stmt = select(func.count(WorkItem.id)).where(WorkItem.project_id == project_id)
+        count_stmt = select(func.count(WorkItem.id)).where(
+            WorkItem.project_id == project_id
+        )
 
         if status:
             stmt = stmt.where(WorkItem.status == status)
@@ -626,9 +631,7 @@ class WorkItemRepository:
 
     # ---------------- Workflow Statuses & Transitions ---------------- #
 
-    async def get_project_statuses(
-        self, project_id: uuid.UUID
-    ) -> list[WorkflowStatus]:
+    async def get_project_statuses(self, project_id: uuid.UUID) -> list[WorkflowStatus]:
         """Get workflow statuses configured for a project, or system defaults."""
         stmt = (
             select(WorkflowStatus)
@@ -696,7 +699,7 @@ class WorkItemRepository:
         return list(res.scalars().all())
 
     async def has_configured_transitions(self, project_id: uuid.UUID) -> bool:
-        """Check if any explicit workflow transitions are configured for project statuses."""
+        """Check if any explicit workflow transitions exist for project statuses."""
         stmt = (
             select(func.count(WorkflowTransition.id))
             .join(
@@ -786,3 +789,198 @@ class WorkItemRepository:
         )
         res = await self.session.execute(stmt)
         return list(res.scalars().all()), total
+
+    async def get_task_details(
+        self, work_item_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> WorkItem | None:
+        """Fetch full work item details with all collaboration relationships loaded."""
+        stmt = (
+            select(WorkItem)
+            .options(
+                selectinload(WorkItem.project),
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.reporter),
+                selectinload(WorkItem.checklists).selectinload(ChecklistItem.assignee),
+                selectinload(WorkItem.attachments).selectinload(Attachment.uploader),
+                selectinload(WorkItem.children).selectinload(WorkItem.assignee),
+                selectinload(WorkItem.comments).selectinload(WorkItemComment.author),
+            )
+            .where(WorkItem.id == work_item_id)
+        )
+        if project_id is not None:
+            stmt = stmt.where(WorkItem.project_id == project_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    # -------------------------------------------------------------
+    # Checklists
+    # -------------------------------------------------------------
+
+    async def create_checklist_item(
+        self,
+        work_item_id: uuid.UUID,
+        title: str,
+        assignee_id: uuid.UUID | None = None,
+        position: int | None = None,
+    ) -> ChecklistItem:
+        """Create a new checklist item under a task."""
+        if position is None:
+            max_pos_stmt = select(
+                func.coalesce(func.max(ChecklistItem.position), -1)
+            ).where(ChecklistItem.work_item_id == work_item_id)
+            max_pos = (await self.session.execute(max_pos_stmt)).scalar() or -1
+            position = max_pos + 1
+
+        item = ChecklistItem(
+            work_item_id=work_item_id,
+            title=title,
+            assignee_id=assignee_id,
+            position=position,
+            is_completed=False,
+        )
+        self.session.add(item)
+        await self.session.flush()
+        return item
+
+    async def get_checklist_item_by_id(
+        self,
+        item_id: uuid.UUID,
+        work_item_id: uuid.UUID | None = None,
+    ) -> ChecklistItem | None:
+        """Get checklist item with assignee eagerly loaded."""
+        stmt = (
+            select(ChecklistItem)
+            .options(selectinload(ChecklistItem.assignee))
+            .where(ChecklistItem.id == item_id)
+        )
+        if work_item_id is not None:
+            stmt = stmt.where(ChecklistItem.work_item_id == work_item_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_checklist_items(
+        self, work_item_id: uuid.UUID
+    ) -> list[ChecklistItem]:
+        """Fetch all checklist items for a task ordered by position."""
+        stmt = (
+            select(ChecklistItem)
+            .options(selectinload(ChecklistItem.assignee))
+            .where(ChecklistItem.work_item_id == work_item_id)
+            .order_by(ChecklistItem.position.asc(), ChecklistItem.created_at.asc())
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def delete_checklist_item(self, item: ChecklistItem) -> None:
+        """Delete checklist item."""
+        await self.session.delete(item)
+        await self.session.flush()
+
+    # -------------------------------------------------------------
+    # Attachments
+    # -------------------------------------------------------------
+
+    async def create_attachment(
+        self,
+        work_item_id: uuid.UUID,
+        uploader_id: uuid.UUID | None,
+        file_name: str,
+        file_size: int,
+        content_type: str,
+        storage_path: str,
+    ) -> Attachment:
+        """Create attachment record for a work item."""
+        attachment = Attachment(
+            work_item_id=work_item_id,
+            uploader_id=uploader_id,
+            file_name=file_name,
+            file_size=file_size,
+            content_type=content_type,
+            storage_path=storage_path,
+        )
+        self.session.add(attachment)
+        await self.session.flush()
+        return attachment
+
+    async def get_attachment_by_id(
+        self,
+        attachment_id: uuid.UUID,
+        work_item_id: uuid.UUID | None = None,
+    ) -> Attachment | None:
+        """Get attachment metadata with uploader eagerly loaded."""
+        stmt = (
+            select(Attachment)
+            .options(selectinload(Attachment.uploader))
+            .where(Attachment.id == attachment_id)
+        )
+        if work_item_id is not None:
+            stmt = stmt.where(Attachment.work_item_id == work_item_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_attachments(self, work_item_id: uuid.UUID) -> list[Attachment]:
+        """Fetch all attachments for a work item."""
+        stmt = (
+            select(Attachment)
+            .options(selectinload(Attachment.uploader))
+            .where(Attachment.work_item_id == work_item_id)
+            .order_by(Attachment.created_at.desc())
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def delete_attachment(self, attachment: Attachment) -> None:
+        """Delete attachment record."""
+        await self.session.delete(attachment)
+        await self.session.flush()
+
+    # -------------------------------------------------------------
+    # Subtasks & Hierarchy Validation
+    # -------------------------------------------------------------
+
+    async def list_subtasks(
+        self,
+        parent_id: uuid.UUID,
+        skip: int = 0,
+        limit: int = 25,
+    ) -> tuple[list[WorkItem], int]:
+        """List subtasks for a parent task with pagination."""
+        count_stmt = select(func.count(WorkItem.id)).where(
+            WorkItem.parent_id == parent_id
+        )
+        total = (await self.session.execute(count_stmt)).scalar() or 0
+
+        stmt = (
+            select(WorkItem)
+            .options(
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.reporter),
+            )
+            .where(WorkItem.parent_id == parent_id)
+            .order_by(WorkItem.sequence_number.asc())
+            .offset(skip)
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all()), total
+
+    async def check_circular_parent(
+        self,
+        task_id: uuid.UUID,
+        candidate_parent_id: uuid.UUID,
+        max_depth: int = 20,
+    ) -> bool:
+        """
+        Check if candidate_parent_id as parent of task_id causes a cycle.
+        Returns True if a cycle is detected, False otherwise.
+        """
+        current_id: uuid.UUID | None = candidate_parent_id
+        depth = 0
+        while current_id is not None and depth < max_depth:
+            if current_id == task_id:
+                return True
+            parent_stmt = select(WorkItem.parent_id).where(WorkItem.id == current_id)
+            res = await self.session.execute(parent_stmt)
+            current_id = res.scalar()
+            depth += 1
+        return False

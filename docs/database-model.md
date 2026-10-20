@@ -216,6 +216,18 @@ All primary keys use UUIDs (UUIDv4/v7), and timestamps are stored with timezone 
 | `storage_path` | `VARCHAR(500)` | Not Null | Storage path or bucket key |
 | `created_at` | `TIMESTAMPTZ` | Not Null, Default `now()` | Upload timestamp |
 
+#### `checklist_items`
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `UUID` | PK, Not Null | Checklist item ID |
+| `work_item_id` | `UUID` | FK `work_items(id)` ON DELETE CASCADE, Index | Parent work item |
+| `title` | `VARCHAR(255)` | Not Null | Checklist item title / description |
+| `is_completed` | `BOOLEAN` | Not Null, Default `false` | Completion state indicator |
+| `position` | `INTEGER` | Not Null, Default `0` | Sort order position within task |
+| `assignee_id` | `UUID` | FK `users(id)` ON DELETE SET NULL, Nullable, Index | Optional item assignee |
+| `created_at` | `TIMESTAMPTZ` | Not Null, Default `now()` | Creation timestamp |
+| `updated_at` | `TIMESTAMPTZ` | Not Null, Default `now()` | Modification timestamp |
+
 #### `workflow_statuses` & `workflow_transitions`
 - `workflow_statuses`: Configurable workflow stages with categories (`todo`, `in_progress`, `done`, `cancelled`).
 - `workflow_transitions`: Valid transition graph restricting allowed state movements.
@@ -234,6 +246,15 @@ All primary keys use UUIDs (UUIDv4/v7), and timestamps are stored with timezone 
 | `is_edited` | `BOOLEAN` | Not Null, Default `false` | Edited status indicator |
 | `created_at` | `TIMESTAMPTZ` | Not Null, Default `now()` | Creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | Not Null, Default `now()` | Modification timestamp |
+
+#### `comment_mentions`
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `UUID` | PK, Not Null | Mention record ID |
+| `comment_id` | `UUID` | FK `work_item_comments(id)` ON DELETE CASCADE, Index | Mentioning comment |
+| `user_id` | `UUID` | FK `users(id)` ON DELETE CASCADE, Index | Mentioned user |
+| `created_at` | `TIMESTAMPTZ` | Not Null, Default `now()` | Mention timestamp |
+*Composite Constraints*: `uq_comment_mentions_comment_user (comment_id, user_id)`
 
 #### `notifications`
 | Column | Type | Constraints | Description |
