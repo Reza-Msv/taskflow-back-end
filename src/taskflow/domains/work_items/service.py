@@ -2,6 +2,7 @@ import math
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,10 +16,11 @@ from taskflow.domains.collaboration.websocket import (
 from taskflow.domains.identity.repository import UserRepository
 from taskflow.domains.organizations.repository import OrganizationRepository
 from taskflow.domains.projects.repository import ProjectRepository
-from taskflow.domains.work_items.models import Attachment, WorkItem
+from taskflow.domains.work_items.models import Attachment, SavedFilter, WorkItem
 from taskflow.domains.work_items.repository import (
     COMPLETED_STATUSES,
     DashboardRepository,
+    SavedFilterRepository,
     WorkItemRepository,
 )
 from taskflow.domains.work_items.schemas import (
@@ -29,12 +31,18 @@ from taskflow.domains.work_items.schemas import (
     ChecklistItemUpdateRequest,
     ChecklistListResponse,
     DashboardSummaryResponse,
+    GlobalSearchResponse,
     KanbanBoardResponse,
     KanbanColumn,
     OverdueUpcomingTasksResponse,
     ProjectBrief,
     ProjectSummary,
+    SavedFilterCreateRequest,
+    SavedFilterUpdateRequest,
+    SearchProjectResult,
+    SearchTaskResult,
     SubtaskCreateRequest,
+    TaskFilterCriteria,
     TaskStatusMoveRequest,
     UserActivityActor,
     UserActivityItem,
@@ -141,14 +149,32 @@ class DashboardService:
         page_size: int = 25,
         status: str | None = None,
         project_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
+        priority: str | None = None,
+        type: str | None = None,
+        search: str | None = None,
         due_date_from: datetime | None = None,
         due_date_to: datetime | None = None,
+        is_overdue: bool | None = None,
+        due_soon: bool | None = None,
+        is_completed: bool | None = None,
         sort_by: str = "smart_order",
         sort_dir: str = "asc",
     ) -> WorkItemListDashboardResponse:
         """
         Get tasks assigned to user with filtering, pagination, and smart ordering.
         """
+        if due_date_from and due_date_to and due_date_from > due_date_to:
+            raise DomainException(
+                code="INVALID_DATE_RANGE",
+                message="due_date_from cannot be after due_date_to.",
+                status_code=400,
+                details={
+                    "due_date_from": str(due_date_from),
+                    "due_date_to": str(due_date_to),
+                },
+            )
+
         now = datetime.now(UTC)
         skip = (page - 1) * page_size
         items, total = await self.repo.list_assigned_tasks(
@@ -158,8 +184,15 @@ class DashboardService:
             limit=page_size,
             status=status,
             project_id=project_id,
+            organization_id=organization_id,
+            priority=priority,
+            type=type,
+            search=search,
             due_date_from=due_date_from,
             due_date_to=due_date_to,
+            is_overdue=is_overdue,
+            due_soon=due_soon,
+            is_completed=is_completed,
             sort_by=sort_by,
             sort_dir=sort_dir,
         )
@@ -295,24 +328,217 @@ class TaskService:
 
     async def list_tasks(
         self,
-        project_id: uuid.UUID,
+        project_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
         status: str | None = None,
         assignee_id: uuid.UUID | None = None,
+        reporter_id: uuid.UUID | None = None,
         priority: str | None = None,
+        type: str | None = None,
         search: str | None = None,
+        due_date_from: datetime | None = None,
+        due_date_to: datetime | None = None,
+        is_overdue: bool | None = None,
+        due_soon: bool | None = None,
+        is_completed: bool | None = None,
+        label_id: uuid.UUID | None = None,
+        sort_by: str = "created_at",
+        sort_dir: str = "desc",
         page: int = 1,
         page_size: int = 25,
+        accessible_filter: Any = None,
     ) -> tuple[list[WorkItem], int]:
-        """List tasks for a project with pagination and filters."""
+        """List tasks with advanced filters, pagination, and sorting."""
+        if due_date_from and due_date_to and due_date_from > due_date_to:
+            raise DomainException(
+                code="INVALID_DATE_RANGE",
+                message="due_date_from cannot be after due_date_to.",
+                status_code=400,
+                details={
+                    "due_date_from": str(due_date_from),
+                    "due_date_to": str(due_date_to),
+                },
+            )
+
         skip = (page - 1) * page_size
         return await self.work_item_repo.list_work_items(
             project_id=project_id,
+            organization_id=organization_id,
             status=status,
             assignee_id=assignee_id,
+            reporter_id=reporter_id,
             priority=priority,
+            type=type,
             search=search,
+            due_date_from=due_date_from,
+            due_date_to=due_date_to,
+            is_overdue=is_overdue,
+            due_soon=due_soon,
+            is_completed=is_completed,
+            label_id=label_id,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
             skip=skip,
             limit=page_size,
+            accessible_filter=accessible_filter,
+        )
+
+    async def get_my_tasks(
+        self,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID | None = None,
+        project_id: uuid.UUID | None = None,
+        status: str | None = None,
+        priority: str | None = None,
+        type: str | None = None,
+        search: str | None = None,
+        due_date_from: datetime | None = None,
+        due_date_to: datetime | None = None,
+        is_overdue: bool | None = None,
+        due_soon: bool | None = None,
+        is_completed: bool | None = None,
+        label_id: uuid.UUID | None = None,
+        sort_by: str = "smart_order",
+        sort_dir: str = "asc",
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[WorkItem], int]:
+        """
+        List tasks assigned to authenticated user with personal filters
+        and access check.
+        """
+        accessible_filter = DashboardRepository(
+            self.session
+        )._accessible_projects_subquery(user_id)
+
+        return await self.list_tasks(
+            project_id=project_id,
+            organization_id=organization_id,
+            status=status,
+            assignee_id=user_id,
+            priority=priority,
+            type=type,
+            search=search,
+            due_date_from=due_date_from,
+            due_date_to=due_date_to,
+            is_overdue=is_overdue,
+            due_soon=due_soon,
+            is_completed=is_completed,
+            label_id=label_id,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            page=page,
+            page_size=page_size,
+            accessible_filter=accessible_filter,
+        )
+
+    async def global_search(
+        self,
+        user_id: uuid.UUID,
+        query: str,
+        search_type: str = "all",
+        organization_id: uuid.UUID | None = None,
+        project_id: uuid.UUID | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> GlobalSearchResponse:
+        """Global search across accessible tasks and projects for user."""
+        clean_q = query.strip()
+        if not clean_q:
+            return GlobalSearchResponse(
+                query="",
+                tasks=[],
+                projects=[],
+                total_tasks=0,
+                total_projects=0,
+                limit=limit,
+                offset=offset,
+            )
+
+        if organization_id is not None:
+            membership = await self.org_repo.get_membership(organization_id, user_id)
+            if membership is None or not membership.is_active:
+                raise DomainException(
+                    code="NOT_AN_ORGANIZATION_MEMBER",
+                    message="You are not an active member of this organization.",
+                    status_code=status.HTTP_403_FORBIDDEN,
+                )
+
+        if project_id is not None:
+            project = await self.project_repo.get_by_id(
+                project_id, org_id=organization_id
+            )
+            if project is None:
+                raise DomainException(
+                    code="PROJECT_NOT_FOUND",
+                    message="Project not found or inaccessible.",
+                    status_code=status.HTTP_404_NOT_FOUND,
+                )
+
+        accessible_filter = DashboardRepository(
+            self.session
+        )._accessible_projects_subquery(user_id)
+
+        task_results: list[SearchTaskResult] = []
+        total_tasks = 0
+        if search_type in ("all", "tasks"):
+            task_rows, total_tasks = await self.work_item_repo.search_tasks(
+                query=clean_q,
+                accessible_filter=accessible_filter,
+                organization_id=organization_id,
+                project_id=project_id,
+                limit=limit,
+                offset=offset,
+            )
+            for item, matched_field in task_rows:
+                task_results.append(
+                    SearchTaskResult(
+                        id=item.id,
+                        issue_key=item.issue_key,
+                        title=item.title,
+                        description=item.description,
+                        status=item.status,
+                        priority=item.priority,
+                        type=item.type,
+                        project_id=item.project.id,
+                        project_name=item.project.name,
+                        project_key=item.project.key,
+                        organization_id=item.organization_id,
+                        matched_field=matched_field,
+                    )
+                )
+
+        project_results: list[SearchProjectResult] = []
+        total_projects = 0
+        if search_type in ("all", "projects") and project_id is None:
+            proj_rows, total_projects = await self.work_item_repo.search_projects(
+                query=clean_q,
+                accessible_filter=accessible_filter,
+                organization_id=organization_id,
+                limit=limit,
+                offset=offset,
+            )
+            for proj, matched_field in proj_rows:
+                project_results.append(
+                    SearchProjectResult(
+                        id=proj.id,
+                        name=proj.name,
+                        key=proj.key,
+                        description=proj.description,
+                        organization_id=proj.organization_id,
+                        is_private=proj.is_private,
+                        matched_field=matched_field,
+                    )
+                )
+
+        return GlobalSearchResponse(
+            query=clean_q,
+            tasks=task_results,
+            projects=project_results,
+            total_tasks=total_tasks,
+            total_projects=total_projects,
+            limit=limit,
+            offset=offset,
         )
 
     async def create_task(
@@ -1547,3 +1773,171 @@ class TaskService:
             page_size=page_size,
             total=total,
         )
+
+
+class SavedFilterService:
+    """Service managing persistent saved filters and views."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.repo = SavedFilterRepository(session)
+        self.work_item_repo = WorkItemRepository(session)
+        self.org_repo = OrganizationRepository(session)
+        self.project_repo = ProjectRepository(session)
+        self.task_service = TaskService(session)
+
+    async def create_saved_filter(
+        self,
+        user_id: uuid.UUID,
+        request: SavedFilterCreateRequest,
+    ) -> SavedFilter:
+        """Create a user-owned saved filter after validating scope and criteria."""
+        if request.organization_id is not None:
+            membership = await self.org_repo.get_membership(
+                request.organization_id, user_id
+            )
+            if membership is None or not membership.is_active:
+                raise DomainException(
+                    code="NOT_AN_ORGANIZATION_MEMBER",
+                    message="You are not an active member of this organization.",
+                    status_code=status.HTTP_403_FORBIDDEN,
+                )
+
+        if request.project_id is not None:
+            project = await self.project_repo.get_by_id(
+                request.project_id, org_id=request.organization_id
+            )
+            if project is None:
+                raise DomainException(
+                    code="PROJECT_NOT_FOUND",
+                    message="Project not found or inaccessible.",
+                    status_code=status.HTTP_404_NOT_FOUND,
+                )
+
+        filter_dict = request.filter_criteria.model_dump(
+            mode="json", exclude_none=True
+        )
+
+        saved_filter = SavedFilter(
+            user_id=user_id,
+            organization_id=request.organization_id,
+            project_id=request.project_id,
+            name=request.name.strip(),
+            description=request.description.strip() if request.description else None,
+            filter_criteria=filter_dict,
+            sort_by=request.sort_by,
+            sort_dir=request.sort_dir,
+            view_type=request.view_type,
+            is_favorite=request.is_favorite,
+        )
+        created = await self.repo.create(saved_filter)
+        await self.session.commit()
+        return created
+
+    async def get_saved_filter(
+        self,
+        filter_id: uuid.UUID,
+        user_id: uuid.UUID,
+    ) -> SavedFilter:
+        """Fetch a saved filter enforcing strict ownership isolation."""
+        sf = await self.repo.get_by_id(filter_id)
+        if sf is None or sf.user_id != user_id:
+            raise DomainException(
+                code="SAVED_FILTER_NOT_FOUND",
+                message="Saved filter not found or inaccessible.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return sf
+
+    async def list_saved_filters(
+        self,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID | None = None,
+        project_id: uuid.UUID | None = None,
+    ) -> list[SavedFilter]:
+        """List saved filters owned by the user."""
+        return await self.repo.list_for_user(
+            user_id=user_id,
+            organization_id=organization_id,
+            project_id=project_id,
+        )
+
+    async def update_saved_filter(
+        self,
+        filter_id: uuid.UUID,
+        user_id: uuid.UUID,
+        request: SavedFilterUpdateRequest,
+    ) -> SavedFilter:
+        """Update properties of a user's saved filter."""
+        sf = await self.get_saved_filter(filter_id, user_id=user_id)
+        if request.name is not None:
+            sf.name = request.name.strip()
+        if request.description is not None:
+            sf.description = (
+                request.description.strip() if request.description else None
+            )
+        if request.filter_criteria is not None:
+            sf.filter_criteria = request.filter_criteria.model_dump(
+                mode="json", exclude_none=True
+            )
+        if request.sort_by is not None:
+            sf.sort_by = request.sort_by
+        if request.sort_dir is not None:
+            sf.sort_dir = request.sort_dir
+        if request.view_type is not None:
+            sf.view_type = request.view_type
+        if request.is_favorite is not None:
+            sf.is_favorite = request.is_favorite
+        updated = await self.repo.update(sf)
+        await self.session.commit()
+        return updated
+
+    async def delete_saved_filter(
+        self,
+        filter_id: uuid.UUID,
+        user_id: uuid.UUID,
+    ) -> None:
+        """Delete a saved filter owned by the user."""
+        sf = await self.get_saved_filter(filter_id, user_id=user_id)
+        await self.repo.delete(sf)
+        await self.session.commit()
+
+    async def execute_saved_filter(
+        self,
+        filter_id: uuid.UUID,
+        user_id: uuid.UUID,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[WorkItem], int]:
+        """Execute saved filter criteria and return matching accessible tasks."""
+        sf = await self.get_saved_filter(filter_id, user_id=user_id)
+        crit = TaskFilterCriteria.model_validate(sf.filter_criteria)
+
+        accessible_filter = DashboardRepository(
+            self.session
+        )._accessible_projects_subquery(user_id)
+
+        assignee_id = user_id if crit.assigned_to_me else crit.assignee_id
+
+        return await self.task_service.list_tasks(
+            project_id=sf.project_id,
+            organization_id=sf.organization_id,
+            status=crit.status,
+            assignee_id=assignee_id,
+            reporter_id=crit.reporter_id,
+            priority=crit.priority,
+            type=crit.type,
+            search=crit.search,
+            due_date_from=crit.due_date_from,
+            due_date_to=crit.due_date_to,
+            is_overdue=crit.is_overdue,
+            due_soon=crit.due_soon,
+            is_completed=crit.is_completed,
+            label_id=crit.label_id,
+            sort_by=sf.sort_by or "created_at",
+            sort_dir=sf.sort_dir or "desc",
+            page=page,
+            page_size=page_size,
+            accessible_filter=accessible_filter,
+        )
+

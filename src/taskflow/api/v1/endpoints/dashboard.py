@@ -57,6 +57,18 @@ async def get_my_tasks(
     project_id: Annotated[
         uuid.UUID | None, Query(description="Filter by project ID")
     ] = None,
+    organization_id: Annotated[
+        uuid.UUID | None, Query(description="Filter by organization ID")
+    ] = None,
+    priority: Annotated[
+        str | None, Query(description="Filter by task priority")
+    ] = None,
+    type: Annotated[
+        str | None, Query(description="Filter by work item type")
+    ] = None,
+    search: Annotated[
+        str | None, Query(description="Search title, key, or description")
+    ] = None,
     due_date_from: Annotated[
         datetime | None,
         Query(description="Filter tasks with due date on or after this UTC timestamp"),
@@ -64,6 +76,15 @@ async def get_my_tasks(
     due_date_to: Annotated[
         datetime | None,
         Query(description="Filter tasks with due date on or before this UTC timestamp"),
+    ] = None,
+    is_overdue: Annotated[
+        bool | None, Query(description="Filter overdue incomplete tasks")
+    ] = None,
+    due_soon: Annotated[
+        bool | None, Query(description="Filter tasks due in next 7 days")
+    ] = None,
+    is_completed: Annotated[
+        bool | None, Query(description="Filter completed tasks")
     ] = None,
     sort_by: Annotated[
         Literal["smart_order", "due_date", "priority", "created_at", "updated_at"],
@@ -86,8 +107,15 @@ async def get_my_tasks(
         page_size=page_size,
         status=status,
         project_id=project_id,
+        organization_id=organization_id,
+        priority=priority,
+        type=type,
+        search=search,
         due_date_from=due_date_from,
         due_date_to=due_date_to,
+        is_overdue=is_overdue,
+        due_soon=due_soon,
+        is_completed=is_completed,
         sort_by=sort_by,
         sort_dir=sort_dir,
     )

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     Column,
@@ -447,3 +448,68 @@ class ChecklistItem(Base, UUIDMixin, TimestampMixin):
     assignee: Mapped["User | None"] = relationship(
         "User",
     )
+
+
+class SavedFilter(Base, UUIDMixin, TimestampMixin):
+    """User-owned persistent saved filter / view for work items."""
+
+    __tablename__ = "saved_filters"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    description: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+    )
+    filter_criteria: Mapped[dict] = mapped_column(
+        JSON,
+        default=dict,
+        nullable=False,
+    )
+    sort_by: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+    sort_dir: Mapped[str | None] = mapped_column(
+        String(10),
+        nullable=True,
+    )
+    view_type: Mapped[str] = mapped_column(
+        String(50),
+        default="list",
+        nullable=False,
+    )
+    is_favorite: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_saved_filters_org_user", "organization_id", "user_id"),
+    )
+
+    user: Mapped["User"] = relationship("User")
+    organization: Mapped["Organization | None"] = relationship("Organization")
+    project: Mapped["Project | None"] = relationship("Project")
+

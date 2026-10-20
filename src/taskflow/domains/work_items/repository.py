@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select
@@ -12,10 +12,12 @@ from taskflow.domains.projects.models import Project, ProjectMembership, Project
 from taskflow.domains.work_items.models import (
     Attachment,
     ChecklistItem,
+    SavedFilter,
     WorkflowStatus,
     WorkflowTransition,
     WorkItem,
     WorkItemActivity,
+    work_item_labels,
 )
 
 # Standard terminal / completed status categories or names
@@ -213,8 +215,15 @@ class DashboardRepository:
         limit: int = 25,
         status: str | None = None,
         project_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
+        priority: str | None = None,
+        type: str | None = None,
+        search: str | None = None,
         due_date_from: datetime | None = None,
         due_date_to: datetime | None = None,
+        is_overdue: bool | None = None,
+        due_soon: bool | None = None,
+        is_completed: bool | None = None,
         sort_by: str = "smart_order",
         sort_dir: str = "asc",
     ) -> tuple[list[WorkItem], int]:
@@ -233,10 +242,57 @@ class DashboardRepository:
             conditions.append(func.lower(WorkItem.status) == status.strip().lower())
         if project_id:
             conditions.append(WorkItem.project_id == project_id)
+        if organization_id:
+            conditions.append(WorkItem.organization_id == organization_id)
+        if priority:
+            conditions.append(func.lower(WorkItem.priority) == priority.strip().lower())
+        if type:
+            conditions.append(func.lower(WorkItem.type) == type.strip().lower())
         if due_date_from:
             conditions.append(WorkItem.due_date >= due_date_from)
         if due_date_to:
             conditions.append(WorkItem.due_date <= due_date_to)
+
+        is_completed_expr = func.lower(WorkItem.status).in_(COMPLETED_STATUSES)
+        if is_completed is not None:
+            if is_completed:
+                conditions.append(is_completed_expr)
+            else:
+                conditions.append(~is_completed_expr)
+
+        if is_overdue is not None:
+            overdue_cond = and_(
+                WorkItem.due_date.isnot(None),
+                WorkItem.due_date < now,
+                ~is_completed_expr,
+            )
+            if is_overdue:
+                conditions.append(overdue_cond)
+            else:
+                conditions.append(~overdue_cond)
+
+        if due_soon is not None:
+            seven_days = now + timedelta(days=7)
+            soon_cond = and_(
+                WorkItem.due_date.isnot(None),
+                WorkItem.due_date >= now,
+                WorkItem.due_date <= seven_days,
+                ~is_completed_expr,
+            )
+            if due_soon:
+                conditions.append(soon_cond)
+            else:
+                conditions.append(~soon_cond)
+
+        if search:
+            pat = f"%{search.strip()}%"
+            conditions.append(
+                or_(
+                    WorkItem.title.ilike(pat),
+                    WorkItem.issue_key.ilike(pat),
+                    WorkItem.description.ilike(pat),
+                )
+            )
 
         # Count total
         count_stmt = (
@@ -255,17 +311,22 @@ class DashboardRepository:
             # 2. Upcoming incomplete items with due dates (due_date >= now)
             # 3. Incomplete items without due date
             # 4. Completed items last
-            is_completed = func.lower(WorkItem.status).in_(COMPLETED_STATUSES)
-            is_overdue = and_(
+            completed_cond = func.lower(WorkItem.status).in_(COMPLETED_STATUSES)
+            overdue_cond = and_(
                 WorkItem.due_date.isnot(None),
                 WorkItem.due_date < now,
-                ~is_completed,
+                ~completed_cond,
             )
-            has_due = and_(WorkItem.due_date.isnot(None), ~is_completed)
+            has_due = and_(WorkItem.due_date.isnot(None), ~completed_cond)
 
             order_clauses.extend(
                 [
-                    case((is_completed, 4), (is_overdue, 1), (has_due, 2), else_=3),
+                    case(
+                        (completed_cond, 4),
+                        (overdue_cond, 1),
+                        (has_due, 2),
+                        else_=3,
+                    ),
                     WorkItem.due_date.asc().nulls_last(),
                     WorkItem.priority.desc(),
                     WorkItem.created_at.desc(),
@@ -561,47 +622,176 @@ class WorkItemRepository:
 
     async def list_work_items(
         self,
-        project_id: uuid.UUID,
+        project_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
         status: str | None = None,
         assignee_id: uuid.UUID | None = None,
+        reporter_id: uuid.UUID | None = None,
         priority: str | None = None,
+        type: str | None = None,
         search: str | None = None,
+        due_date_from: datetime | None = None,
+        due_date_to: datetime | None = None,
+        is_overdue: bool | None = None,
+        due_soon: bool | None = None,
+        is_completed: bool | None = None,
+        label_id: uuid.UUID | None = None,
+        sort_by: str = "created_at",
+        sort_dir: str = "desc",
         skip: int = 0,
         limit: int = 25,
+        accessible_filter: Any = None,
     ) -> tuple[list[WorkItem], int]:
-        """List work items in a project with pagination and filters."""
-        stmt = select(WorkItem).where(WorkItem.project_id == project_id)
-        count_stmt = select(func.count(WorkItem.id)).where(
-            WorkItem.project_id == project_id
-        )
+        """
+        List work items with advanced filters, pagination, and deterministic
+        sorting.
+        """
+        now = datetime.now(UTC)
+        conditions = []
 
+        if project_id is not None:
+            conditions.append(WorkItem.project_id == project_id)
+        if organization_id is not None:
+            conditions.append(WorkItem.organization_id == organization_id)
+        if accessible_filter is not None:
+            conditions.append(accessible_filter)
         if status:
-            stmt = stmt.where(WorkItem.status == status)
-            count_stmt = count_stmt.where(WorkItem.status == status)
-        if assignee_id:
-            stmt = stmt.where(WorkItem.assignee_id == assignee_id)
-            count_stmt = count_stmt.where(WorkItem.assignee_id == assignee_id)
+            conditions.append(func.lower(WorkItem.status) == status.strip().lower())
+        if assignee_id is not None:
+            conditions.append(WorkItem.assignee_id == assignee_id)
+        if reporter_id is not None:
+            conditions.append(WorkItem.reporter_id == reporter_id)
         if priority:
-            stmt = stmt.where(WorkItem.priority == priority)
-            count_stmt = count_stmt.where(WorkItem.priority == priority)
+            conditions.append(func.lower(WorkItem.priority) == priority.strip().lower())
+        if type:
+            conditions.append(func.lower(WorkItem.type) == type.strip().lower())
+        if due_date_from is not None:
+            conditions.append(WorkItem.due_date >= due_date_from)
+        if due_date_to is not None:
+            conditions.append(WorkItem.due_date <= due_date_to)
+
+        is_completed_expr = func.lower(WorkItem.status).in_(COMPLETED_STATUSES)
+        if is_completed is not None:
+            if is_completed:
+                conditions.append(is_completed_expr)
+            else:
+                conditions.append(~is_completed_expr)
+
+        if is_overdue is not None:
+            overdue_cond = and_(
+                WorkItem.due_date.isnot(None),
+                WorkItem.due_date < now,
+                ~is_completed_expr,
+            )
+            if is_overdue:
+                conditions.append(overdue_cond)
+            else:
+                conditions.append(~overdue_cond)
+
+        if due_soon is not None:
+            seven_days = now + timedelta(days=7)
+            soon_cond = and_(
+                WorkItem.due_date.isnot(None),
+                WorkItem.due_date >= now,
+                WorkItem.due_date <= seven_days,
+                ~is_completed_expr,
+            )
+            if due_soon:
+                conditions.append(soon_cond)
+            else:
+                conditions.append(~soon_cond)
+
         if search:
             pat = f"%{search.strip()}%"
-            filter_search = or_(
-                WorkItem.title.ilike(pat),
-                WorkItem.issue_key.ilike(pat),
+            conditions.append(
+                or_(
+                    WorkItem.title.ilike(pat),
+                    WorkItem.issue_key.ilike(pat),
+                    WorkItem.description.ilike(pat),
+                )
             )
-            stmt = stmt.where(filter_search)
-            count_stmt = count_stmt.where(filter_search)
+
+        if label_id is not None:
+            label_subquery = (
+                select(work_item_labels.c.work_item_id)
+                .where(work_item_labels.c.label_id == label_id)
+                .scalar_subquery()
+            )
+            conditions.append(WorkItem.id.in_(label_subquery))
+
+        count_stmt = select(func.count(WorkItem.id))
+        if accessible_filter is not None:
+            count_stmt = count_stmt.join(Project, Project.id == WorkItem.project_id)
+        if conditions:
+            count_stmt = count_stmt.where(*conditions)
 
         total_res = await self.session.execute(count_stmt)
         total = int(total_res.scalar_one() or 0)
+
+        stmt = select(WorkItem)
+        if accessible_filter is not None:
+            stmt = stmt.join(Project, Project.id == WorkItem.project_id)
+        if conditions:
+            stmt = stmt.where(*conditions)
+
+        order_clauses = []
+        is_desc = sort_dir.lower() == "desc"
+        if sort_by == "smart_order":
+            is_overdue_case = and_(
+                WorkItem.due_date.isnot(None),
+                WorkItem.due_date < now,
+                ~is_completed_expr,
+            )
+            has_due_case = and_(WorkItem.due_date.isnot(None), ~is_completed_expr)
+            order_clauses.extend(
+                [
+                    case(
+                        (is_completed_expr, 4),
+                        (is_overdue_case, 1),
+                        (has_due_case, 2),
+                        else_=3,
+                    ),
+                    WorkItem.due_date.asc().nulls_last(),
+                    WorkItem.priority.desc(),
+                    WorkItem.created_at.desc(),
+                ]
+            )
+        elif sort_by == "due_date":
+            order_clauses.append(
+                WorkItem.due_date.desc().nulls_last()
+                if is_desc
+                else WorkItem.due_date.asc().nulls_last()
+            )
+        elif sort_by == "priority":
+            order_clauses.append(
+                WorkItem.priority.desc() if is_desc else WorkItem.priority.asc()
+            )
+        elif sort_by == "updated_at":
+            order_clauses.append(
+                WorkItem.updated_at.desc() if is_desc else WorkItem.updated_at.asc()
+            )
+        elif sort_by == "title":
+            order_clauses.append(
+                WorkItem.title.desc() if is_desc else WorkItem.title.asc()
+            )
+        elif sort_by == "rank":
+            order_clauses.append(
+                WorkItem.rank.desc() if is_desc else WorkItem.rank.asc()
+            )
+        else:
+            order_clauses.append(
+                WorkItem.created_at.desc() if is_desc else WorkItem.created_at.asc()
+            )
+
+        order_clauses.append(WorkItem.id.asc())
 
         stmt = (
             stmt.options(
                 selectinload(WorkItem.assignee),
                 selectinload(WorkItem.reporter),
+                selectinload(WorkItem.project),
             )
-            .order_by(WorkItem.created_at.desc())
+            .order_by(*order_clauses)
             .offset(skip)
             .limit(limit)
         )
@@ -984,3 +1174,158 @@ class WorkItemRepository:
             current_id = res.scalar()
             depth += 1
         return False
+
+    async def search_tasks(
+        self,
+        query: str,
+        accessible_filter: Any,
+        organization_id: uuid.UUID | None = None,
+        project_id: uuid.UUID | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[tuple[WorkItem, str]], int]:
+        """Search accessible tasks matching title, description, or issue key."""
+        pat = f"%{query.strip()}%"
+        matched_field_case = case(
+            (WorkItem.issue_key.ilike(pat), "issue_key"),
+            (WorkItem.title.ilike(pat), "title"),
+            else_="description",
+        ).label("matched_field")
+
+        search_filter = or_(
+            WorkItem.issue_key.ilike(pat),
+            WorkItem.title.ilike(pat),
+            WorkItem.description.ilike(pat),
+        )
+
+        conditions = [
+            accessible_filter,
+            search_filter,
+        ]
+        if organization_id is not None:
+            conditions.append(WorkItem.organization_id == organization_id)
+        if project_id is not None:
+            conditions.append(WorkItem.project_id == project_id)
+
+        count_stmt = (
+            select(func.count(WorkItem.id))
+            .join(Project, Project.id == WorkItem.project_id)
+            .where(*conditions)
+        )
+        total_res = await self.session.execute(count_stmt)
+        total = int(total_res.scalar_one() or 0)
+
+        stmt = (
+            select(WorkItem, matched_field_case)
+            .join(Project, Project.id == WorkItem.project_id)
+            .options(
+                selectinload(WorkItem.project),
+            )
+            .where(*conditions)
+            .order_by(WorkItem.created_at.desc(), WorkItem.id.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        res = await self.session.execute(stmt)
+        rows = res.all()
+        return [(item, matched_field) for item, matched_field in rows], total
+
+    async def search_projects(
+        self,
+        query: str,
+        accessible_filter: Any,
+        organization_id: uuid.UUID | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[tuple[Project, str]], int]:
+        """Search accessible projects matching name, key, or description."""
+        pat = f"%{query.strip()}%"
+        matched_field_case = case(
+            (Project.key.ilike(pat), "key"),
+            (Project.name.ilike(pat), "name"),
+            else_="description",
+        ).label("matched_field")
+
+        search_filter = or_(
+            Project.key.ilike(pat),
+            Project.name.ilike(pat),
+            Project.description.ilike(pat),
+        )
+
+        conditions = [
+            accessible_filter,
+            search_filter,
+        ]
+        if organization_id is not None:
+            conditions.append(Project.organization_id == organization_id)
+
+        count_stmt = select(func.count(Project.id)).where(*conditions)
+        total_res = await self.session.execute(count_stmt)
+        total = int(total_res.scalar_one() or 0)
+
+        stmt = (
+            select(Project, matched_field_case)
+            .where(*conditions)
+            .order_by(Project.name.asc(), Project.id.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        res = await self.session.execute(stmt)
+        rows = res.all()
+        return [(proj, matched_field) for proj, matched_field in rows], total
+
+
+class SavedFilterRepository:
+    """Persistence operations for saved filters/views."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def create(self, saved_filter: SavedFilter) -> SavedFilter:
+        self.session.add(saved_filter)
+        await self.session.flush()
+        return saved_filter
+
+    async def get_by_id(self, filter_id: uuid.UUID) -> SavedFilter | None:
+        stmt = select(SavedFilter).where(SavedFilter.id == filter_id)
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def list_for_user(
+        self,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID | None = None,
+        project_id: uuid.UUID | None = None,
+    ) -> list[SavedFilter]:
+        stmt = select(SavedFilter).where(SavedFilter.user_id == user_id)
+        if organization_id is not None:
+            stmt = stmt.where(
+                or_(
+                    SavedFilter.organization_id == organization_id,
+                    SavedFilter.organization_id.is_(None),
+                )
+            )
+        if project_id is not None:
+            stmt = stmt.where(
+                or_(
+                    SavedFilter.project_id == project_id,
+                    SavedFilter.project_id.is_(None),
+                )
+            )
+        stmt = stmt.order_by(
+            SavedFilter.is_favorite.desc(),
+            SavedFilter.name.asc(),
+            SavedFilter.created_at.desc(),
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def update(self, saved_filter: SavedFilter) -> SavedFilter:
+        saved_filter.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return saved_filter
+
+    async def delete(self, saved_filter: SavedFilter) -> None:
+        await self.session.delete(saved_filter)
+        await self.session.flush()
+

@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
@@ -152,8 +153,43 @@ async def list_tasks(
     assignee_id: uuid.UUID | None = Query(
         None, description="Filter by assignee user ID"
     ),
+    assigned_to_me: bool | None = Query(
+        None, description="Filter tasks assigned to current user"
+    ),
+    reporter_id: uuid.UUID | None = Query(
+        None, description="Filter by reporter/creator user ID"
+    ),
     priority: str | None = Query(None, description="Filter by priority"),
-    search: str | None = Query(None, description="Search by title or issue key"),
+    type: str | None = Query(None, description="Filter by work item type"),
+    search: str | None = Query(
+        None, description="Search title, key, or description"
+    ),
+    due_date_from: datetime | None = Query(
+        None, description="Due date starting range"
+    ),
+    due_date_to: datetime | None = Query(
+        None, description="Due date ending range"
+    ),
+    is_overdue: bool | None = Query(
+        None, description="Filter overdue incomplete tasks"
+    ),
+    due_soon: bool | None = Query(
+        None, description="Filter tasks due in next 7 days"
+    ),
+    is_completed: bool | None = Query(
+        None, description="Filter completed tasks"
+    ),
+    label_id: uuid.UUID | None = Query(
+        None, description="Filter by taxonomic label ID"
+    ),
+    sort_by: str = Query(
+        "created_at",
+        description=(
+            "Sort field: created_at, updated_at, due_date, "
+            "priority, title, rank, smart_order"
+        ),
+    ),
+    sort_dir: str = Query("desc", description="Sort direction: asc, desc"),
 ) -> WorkItemListResponse:
     """List tasks in a project with pagination and filters."""
     org_membership = await get_org_membership(
@@ -166,12 +202,25 @@ async def list_tasks(
         project, current_user.id, org_membership, project_service
     )
 
+    effective_assignee = current_user.id if assigned_to_me else assignee_id
+
     tasks, total = await task_service.list_tasks(
         project_id=project_id,
+        organization_id=organization_id,
         status=status,
-        assignee_id=assignee_id,
+        assignee_id=effective_assignee,
+        reporter_id=reporter_id,
         priority=priority,
+        type=type,
         search=search,
+        due_date_from=due_date_from,
+        due_date_to=due_date_to,
+        is_overdue=is_overdue,
+        due_soon=due_soon,
+        is_completed=is_completed,
+        label_id=label_id,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         page=page,
         page_size=page_size,
     )
