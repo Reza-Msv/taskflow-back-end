@@ -163,18 +163,28 @@ class WorkItemResponse(BaseModel):
     organization_id: uuid.UUID = Field(..., description="Organization identifier")
     sequence_number: int = Field(..., description="Sequential integer counter")
     issue_key: str = Field(..., description="Human-readable issue key (e.g. TF-101)")
-    type: str = Field(..., description="Work item type (task, bug, story, epic, subtask)")
+    type: str = Field(
+        ..., description="Work item type (task, bug, story, epic, subtask)"
+    )
     title: str = Field(..., description="Summary title")
     description: str | None = Field(default=None, description="Markdown description")
-    status: str = Field(..., description="Status (todo, in_progress, done, cancelled, etc.)")
-    priority: str = Field(..., description="Priority (lowest, low, medium, high, urgent)")
+    status: str = Field(
+        ..., description="Status (todo, in_progress, done, cancelled, etc.)"
+    )
+    priority: str = Field(
+        ..., description="Priority (lowest, low, medium, high, urgent)"
+    )
     parent_id: uuid.UUID | None = Field(default=None, description="Parent work item ID")
     reporter_id: uuid.UUID | None = Field(default=None, description="Creating user ID")
     assignee_id: uuid.UUID | None = Field(default=None, description="Assigned user ID")
     sprint_id: uuid.UUID | None = Field(default=None, description="Assigned sprint ID")
     rank: str = Field(..., description="Lexicographical relative rank")
-    due_date: datetime | None = Field(default=None, description="Due date timestamp (UTC)")
-    estimated_points: float | None = Field(default=None, description="Story points estimate")
+    due_date: datetime | None = Field(
+        default=None, description="Due date timestamp (UTC)"
+    )
+    estimated_points: float | None = Field(
+        default=None, description="Story points estimate"
+    )
     version: int = Field(..., description="Optimistic concurrency version lock")
     created_at: datetime = Field(..., description="Creation timestamp (UTC)")
     updated_at: datetime = Field(..., description="Last update timestamp (UTC)")
@@ -281,7 +291,9 @@ class WorkItemUpdateRequest(BaseModel):
 class TaskStatusMoveRequest(BaseModel):
     """Payload for moving a task between Kanban columns or reordering."""
 
-    status: str = Field(..., description="Target status name (e.g. todo, in_progress, done)")
+    status: str = Field(
+        ..., description="Target status name (e.g. todo, in_progress, done)"
+    )
     rank: str | None = Field(
         default=None,
         description="Optional new rank string for column/backlog ordering",
@@ -298,11 +310,17 @@ class WorkflowStatusResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID = Field(..., description="Unique status ID")
-    project_id: uuid.UUID | None = Field(default=None, description="Associated project ID")
+    project_id: uuid.UUID | None = Field(
+        default=None, description="Associated project ID"
+    )
     name: str = Field(..., description="Status display name")
-    category: str = Field(..., description="Status category: todo, in_progress, done, cancelled")
+    category: str = Field(
+        ..., description="Status category: todo, in_progress, done, cancelled"
+    )
     position: int = Field(..., description="Column position order")
-    is_default: bool = Field(..., description="Whether this is the default initial status")
+    is_default: bool = Field(
+        ..., description="Whether this is the default initial status"
+    )
 
 
 class KanbanColumn(BaseModel):
@@ -333,17 +351,189 @@ class WorkItemActivityResponse(BaseModel):
     id: uuid.UUID = Field(..., description="Activity event ID")
     work_item_id: uuid.UUID = Field(..., description="Associated work item ID")
     user_id: uuid.UUID | None = Field(default=None, description="Acting user ID")
-    field: str = Field(..., description="Changed property name (e.g. created, status, assignee_id, priority, due_date)")
+    field: str = Field(
+        ...,
+        description="Changed property (e.g. status, assignee_id, priority, due_date)",
+    )
     old_value: str | None = Field(default=None, description="Value prior to change")
     new_value: str | None = Field(default=None, description="Value after change")
     created_at: datetime = Field(..., description="Event timestamp (UTC)")
-    user: UserActivityActor | None = Field(default=None, description="Acting user details")
+    user: UserActivityActor | None = Field(
+        default=None, description="Acting user details"
+    )
 
 
 class WorkItemHistoryListResponse(BaseModel):
     """Paginated history entries for a work item."""
 
-    items: list[WorkItemActivityResponse] = Field(..., description="List of history events")
+    items: list[WorkItemActivityResponse] = Field(
+        ..., description="List of history events"
+    )
     page: int = Field(default=1, description="Current page number (1-indexed)")
     page_size: int = Field(default=25, description="Number of items per page")
     total: int = Field(..., description="Total history records")
+
+
+# -------------------------------------------------------------
+# Phase 4: Collaboration, Checklists & Attachments Schemas
+# -------------------------------------------------------------
+
+
+class ChecklistItemResponse(BaseModel):
+    """Checklist item under a task."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique checklist item ID")
+    work_item_id: uuid.UUID = Field(..., description="Associated task ID")
+    title: str = Field(..., description="Checklist item content")
+    is_completed: bool = Field(..., description="Whether item is marked complete")
+    position: int = Field(..., description="Sorting order index")
+    assignee_id: uuid.UUID | None = Field(default=None, description="Assigned user ID")
+    assignee: UserActivityActor | None = Field(
+        default=None, description="Assigned user details"
+    )
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    updated_at: datetime = Field(..., description="Last updated timestamp (UTC)")
+
+
+class ChecklistItemCreateRequest(BaseModel):
+    """Payload to create a new checklist item."""
+
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Checklist item text",
+        examples=["Verify database indexes"],
+    )
+    assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional assigned user ID",
+    )
+    position: int | None = Field(
+        default=None,
+        description="Optional sorting position order",
+    )
+
+
+class ChecklistItemUpdateRequest(BaseModel):
+    """Payload to update an existing checklist item."""
+
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="Updated text",
+    )
+    is_completed: bool | None = Field(
+        default=None,
+        description="Updated completion status",
+    )
+    position: int | None = Field(
+        default=None,
+        description="Updated sort position",
+    )
+    assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Updated assignee user ID",
+    )
+
+
+class ChecklistListResponse(BaseModel):
+    """List of checklist items under a task."""
+
+    items: list[ChecklistItemResponse] = Field(..., description="Checklist items")
+    total: int = Field(..., description="Total checklist items count")
+
+
+class AttachmentResponse(BaseModel):
+    """File attachment metadata associated with a task."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique attachment ID")
+    work_item_id: uuid.UUID = Field(..., description="Associated task ID")
+    uploader_id: uuid.UUID | None = Field(default=None, description="Uploading user ID")
+    file_name: str = Field(..., description="Original sanitized file name")
+    file_size: int = Field(..., description="File size in bytes")
+    content_type: str = Field(..., description="MIME content type")
+    storage_path: str = Field(..., description="Stored file identifier")
+    created_at: datetime = Field(..., description="Upload timestamp (UTC)")
+    uploader: UserActivityActor | None = Field(
+        default=None, description="Uploader user details"
+    )
+
+
+class AttachmentListResponse(BaseModel):
+    """List of file attachments on a task."""
+
+    items: list[AttachmentResponse] = Field(..., description="List of attachments")
+    total: int = Field(..., description="Total attachments count")
+
+
+class SubtaskCreateRequest(BaseModel):
+    """Payload to create a child subtask under an existing parent task."""
+
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Subtask title",
+        examples=["Write integration tests"],
+    )
+    description: str | None = Field(
+        default=None,
+        description="Subtask markdown description",
+    )
+    priority: str = Field(
+        default="medium",
+        description="Priority: lowest, low, medium, high, urgent",
+    )
+    status: str | None = Field(
+        default=None,
+        description="Initial status name",
+    )
+    assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Subtask assignee user ID",
+    )
+    due_date: datetime | None = Field(
+        default=None,
+        description="Subtask due date",
+    )
+    estimated_points: float | None = Field(
+        default=None,
+        ge=0,
+        description="Story point estimate",
+    )
+
+
+class WorkItemDetailResponse(WorkItemResponse):
+    """Comprehensive work item detail response including collaboration context."""
+
+    project: ProjectBrief | None = Field(
+        default=None, description="Associated project details"
+    )
+    reporter: UserActivityActor | None = Field(
+        default=None, description="Reporter user details"
+    )
+    assignee: UserActivityActor | None = Field(
+        default=None, description="Assignee user details"
+    )
+    subtasks: list[WorkItemResponse] = Field(
+        default_factory=list, description="Child subtasks"
+    )
+    checklists: list[ChecklistItemResponse] = Field(
+        default_factory=list, description="Checklist items"
+    )
+    attachments: list[AttachmentResponse] = Field(
+        default_factory=list, description="Attached files"
+    )
+    subtasks_count: int = Field(default=0, description="Total child subtasks count")
+    checklists_count: int = Field(default=0, description="Total checklist items count")
+    completed_checklists_count: int = Field(
+        default=0, description="Completed checklist items count"
+    )
+    attachments_count: int = Field(default=0, description="Total attachments count")
+    comments_count: int = Field(default=0, description="Total comments count")

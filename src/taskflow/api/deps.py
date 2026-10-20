@@ -11,9 +11,10 @@ from taskflow.domains.identity.models import Session, User
 from taskflow.domains.identity.service import AuthService
 
 if TYPE_CHECKING:
+    from taskflow.domains.collaboration.service import CollaborationService
     from taskflow.domains.organizations.service import OrganizationService
-    from taskflow.domains.work_items.service import DashboardService
-
+    from taskflow.domains.projects.service import ProjectService
+    from taskflow.domains.work_items.service import DashboardService, TaskService
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -63,6 +64,15 @@ def get_task_service(
     from taskflow.domains.work_items.service import TaskService
 
     return TaskService(session)
+
+
+def get_collaboration_service(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> "CollaborationService":
+    """Dependency injecting CollaborationService with active DB session."""
+    from taskflow.domains.collaboration.service import CollaborationService
+
+    return CollaborationService(session)
 
 
 class SessionCredentials:
