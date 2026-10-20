@@ -82,11 +82,13 @@ class OrganizationMembershipResponse(BaseModel):
 
 
 class OrganizationMembershipListResponse(BaseModel):
-    """List of organization memberships."""
+    """List of organization memberships with pagination."""
 
     items: list[OrganizationMembershipResponse] = Field(
         ..., description="List of memberships"
     )
+    page: int = Field(default=1, description="Current page number (1-indexed)")
+    page_size: int = Field(default=25, description="Number of items per page")
     total: int = Field(..., description="Total count")
 
 
@@ -111,3 +113,37 @@ class UpdateMembershipRoleRequest(BaseModel):
         default=None,
         description="Membership active status flag",
     )
+
+
+class CreateInvitationRequest(BaseModel):
+    """Payload for creating an organization membership invitation."""
+
+    email: str = Field(..., min_length=3, max_length=255, description="Invitee email address")
+    role: OrganizationRole = Field(
+        default="member",
+        description="Assigned role: owner, admin, member, guest, viewer",
+    )
+
+
+class InvitationResponse(BaseModel):
+    """Invitation details DTO."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique invitation identifier")
+    organization_id: uuid.UUID = Field(..., description="Organization ID")
+    email: str = Field(..., description="Invitee email address")
+    role: str = Field(..., description="Assigned role")
+    token: str = Field(..., description="Secure single-use token")
+    invited_by_id: uuid.UUID | None = Field(default=None, description="Inviting user ID")
+    expires_at: datetime = Field(..., description="Expiration timestamp (UTC)")
+    accepted_at: datetime | None = Field(default=None, description="Acceptance timestamp (UTC)")
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    updated_at: datetime = Field(..., description="Last update timestamp (UTC)")
+
+
+class InvitationListResponse(BaseModel):
+    """List of pending organization invitations."""
+
+    items: list[InvitationResponse] = Field(..., description="List of invitations")
+    total: int = Field(..., description="Total count")

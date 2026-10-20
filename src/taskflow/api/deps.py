@@ -47,6 +47,24 @@ def get_dashboard_service(
     return DashboardService(session)
 
 
+def get_project_service(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> "ProjectService":
+    """Dependency injecting ProjectService with active DB session."""
+    from taskflow.domains.projects.service import ProjectService
+
+    return ProjectService(session)
+
+
+def get_task_service(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> "TaskService":
+    """Dependency injecting TaskService with active DB session."""
+    from taskflow.domains.work_items.service import TaskService
+
+    return TaskService(session)
+
+
 class SessionCredentials:
     def __init__(
         self,

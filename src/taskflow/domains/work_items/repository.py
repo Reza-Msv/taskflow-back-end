@@ -2,13 +2,15 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from taskflow.domains.organizations.models import OrganizationMembership
-from taskflow.domains.projects.models import Project, ProjectMembership
+from taskflow.domains.projects.models import Project, ProjectMembership, ProjectSequence
 from taskflow.domains.work_items.models import (
+    WorkflowStatus,
+    WorkflowTransition,
     WorkItem,
     WorkItemActivity,
 )
@@ -462,3 +464,325 @@ class DashboardRepository:
             )
 
         return results, total
+
+
+class WorkItemRepository:
+    """Persistence operations for WorkItem, WorkflowStatus, and WorkItemActivity entities."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get_by_id(
+        self, work_item_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> WorkItem | None:
+        """Fetch work item by primary key, optionally constrained to project."""
+        stmt = (
+            select(WorkItem)
+            .options(
+                selectinload(WorkItem.project),
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.reporter),
+            )
+            .where(WorkItem.id == work_item_id)
+        )
+        if project_id is not None:
+            stmt = stmt.where(WorkItem.project_id == project_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_next_sequence_and_issue_key(
+        self, project_id: uuid.UUID, project_key: str
+    ) -> tuple[int, str]:
+        """
+        Atomically increment the project sequence counter using SELECT ... FOR UPDATE.
+        Guarantees gapless, collision-free issue keys under concurrent requests.
+        """
+        stmt = (
+            select(ProjectSequence)
+            .where(ProjectSequence.project_id == project_id)
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        seq = result.scalar_one_or_none()
+        if seq is None:
+            # Fallback creation if not initialized
+            seq = ProjectSequence(project_id=project_id, current_sequence=0)
+            self.session.add(seq)
+            await self.session.flush()
+
+        seq.current_sequence += 1
+        sequence_num = seq.current_sequence
+        issue_key = f"{project_key}-{sequence_num}"
+        return sequence_num, issue_key
+
+    async def create_work_item(
+        self,
+        project_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        sequence_number: int,
+        issue_key: str,
+        title: str,
+        description: str | None = None,
+        type: str = "task",
+        priority: str = "medium",
+        status: str = "todo",
+        reporter_id: uuid.UUID | None = None,
+        assignee_id: uuid.UUID | None = None,
+        parent_id: uuid.UUID | None = None,
+        due_date: datetime | None = None,
+        estimated_points: float | None = None,
+        rank: str = "0|hzzzzz:",
+    ) -> WorkItem:
+        """Create and persist a new work item."""
+        item = WorkItem(
+            project_id=project_id,
+            organization_id=organization_id,
+            sequence_number=sequence_number,
+            issue_key=issue_key,
+            title=title.strip(),
+            description=description.strip() if description else None,
+            type=type,
+            priority=priority,
+            status=status,
+            reporter_id=reporter_id,
+            assignee_id=assignee_id,
+            parent_id=parent_id,
+            due_date=due_date,
+            estimated_points=estimated_points,
+            rank=rank,
+            version=1,
+        )
+        self.session.add(item)
+        await self.session.flush()
+        return item
+
+    async def list_work_items(
+        self,
+        project_id: uuid.UUID,
+        status: str | None = None,
+        assignee_id: uuid.UUID | None = None,
+        priority: str | None = None,
+        search: str | None = None,
+        skip: int = 0,
+        limit: int = 25,
+    ) -> tuple[list[WorkItem], int]:
+        """List work items in a project with pagination and filters."""
+        stmt = select(WorkItem).where(WorkItem.project_id == project_id)
+        count_stmt = select(func.count(WorkItem.id)).where(WorkItem.project_id == project_id)
+
+        if status:
+            stmt = stmt.where(WorkItem.status == status)
+            count_stmt = count_stmt.where(WorkItem.status == status)
+        if assignee_id:
+            stmt = stmt.where(WorkItem.assignee_id == assignee_id)
+            count_stmt = count_stmt.where(WorkItem.assignee_id == assignee_id)
+        if priority:
+            stmt = stmt.where(WorkItem.priority == priority)
+            count_stmt = count_stmt.where(WorkItem.priority == priority)
+        if search:
+            pat = f"%{search.strip()}%"
+            filter_search = or_(
+                WorkItem.title.ilike(pat),
+                WorkItem.issue_key.ilike(pat),
+            )
+            stmt = stmt.where(filter_search)
+            count_stmt = count_stmt.where(filter_search)
+
+        total_res = await self.session.execute(count_stmt)
+        total = int(total_res.scalar_one() or 0)
+
+        stmt = (
+            stmt.options(
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.reporter),
+            )
+            .order_by(WorkItem.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all()), total
+
+    async def list_all_project_work_items(
+        self, project_id: uuid.UUID
+    ) -> list[WorkItem]:
+        """List all work items for a project (e.g. for Kanban board)."""
+        stmt = (
+            select(WorkItem)
+            .options(
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.reporter),
+            )
+            .where(WorkItem.project_id == project_id)
+            .order_by(WorkItem.rank.asc(), WorkItem.created_at.asc())
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def delete_work_item(self, item: WorkItem) -> None:
+        """Delete a work item."""
+        await self.session.delete(item)
+        await self.session.flush()
+
+    # ---------------- Workflow Statuses & Transitions ---------------- #
+
+    async def get_project_statuses(
+        self, project_id: uuid.UUID
+    ) -> list[WorkflowStatus]:
+        """Get workflow statuses configured for a project, or system defaults."""
+        stmt = (
+            select(WorkflowStatus)
+            .where(
+                or_(
+                    WorkflowStatus.project_id == project_id,
+                    WorkflowStatus.project_id.is_(None),
+                )
+            )
+            .order_by(WorkflowStatus.position.asc(), WorkflowStatus.created_at.asc())
+        )
+        res = await self.session.execute(stmt)
+        statuses = list(res.scalars().all())
+        # If project-specific statuses exist, prefer them over global defaults
+        project_specific = [s for s in statuses if s.project_id == project_id]
+        if project_specific:
+            return project_specific
+        return statuses
+
+    async def get_status_by_name_or_id(
+        self, project_id: uuid.UUID, identifier: str
+    ) -> WorkflowStatus | None:
+        """Find status matching UUID or case-insensitive name in project or system."""
+        # Try UUID first
+        try:
+            status_uuid = uuid.UUID(identifier)
+            stmt = select(WorkflowStatus).where(
+                WorkflowStatus.id == status_uuid,
+                or_(
+                    WorkflowStatus.project_id == project_id,
+                    WorkflowStatus.project_id.is_(None),
+                ),
+            )
+            res = await self.session.execute(stmt)
+            found = res.scalar_one_or_none()
+            if found:
+                return found
+        except ValueError:
+            pass
+
+        # Match name or category or normalized name
+        norm = identifier.strip().lower()
+        stmt = select(WorkflowStatus).where(
+            or_(
+                func.lower(WorkflowStatus.name) == norm,
+                func.lower(WorkflowStatus.name) == norm.replace("_", " "),
+                func.lower(WorkflowStatus.category) == norm,
+            ),
+            or_(
+                WorkflowStatus.project_id == project_id,
+                WorkflowStatus.project_id.is_(None),
+            ),
+        )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def get_allowed_transitions(
+        self, from_status_id: uuid.UUID
+    ) -> list[WorkflowTransition]:
+        """Fetch allowed transitions from a given status."""
+        stmt = select(WorkflowTransition).where(
+            WorkflowTransition.from_status_id == from_status_id
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def has_configured_transitions(self, project_id: uuid.UUID) -> bool:
+        """Check if any explicit workflow transitions are configured for project statuses."""
+        stmt = (
+            select(func.count(WorkflowTransition.id))
+            .join(
+                WorkflowStatus,
+                WorkflowStatus.id == WorkflowTransition.from_status_id,
+            )
+            .where(
+                or_(
+                    WorkflowStatus.project_id == project_id,
+                    WorkflowStatus.project_id.is_(None),
+                )
+            )
+        )
+        res = await self.session.execute(stmt)
+        return int(res.scalar_one() or 0) > 0
+
+    async def ensure_default_workflow_statuses(
+        self, project_id: uuid.UUID
+    ) -> list[WorkflowStatus]:
+        """Initialize standard workflow statuses for a project if none exist."""
+        existing = await self.get_project_statuses(project_id)
+        if existing:
+            return existing
+
+        defaults = [
+            ("To Do", "todo", 1, True),
+            ("In Progress", "in_progress", 2, False),
+            ("Done", "done", 3, False),
+        ]
+        created = []
+        for name, category, pos, is_def in defaults:
+            status_obj = WorkflowStatus(
+                project_id=project_id,
+                name=name,
+                category=category,
+                position=pos,
+                is_default=is_def,
+            )
+            self.session.add(status_obj)
+            created.append(status_obj)
+
+        await self.session.flush()
+        return created
+
+    # ---------------- Task History & Activity Logging ---------------- #
+
+    async def record_activity(
+        self,
+        work_item_id: uuid.UUID,
+        user_id: uuid.UUID | None,
+        field: str,
+        old_value: str | None = None,
+        new_value: str | None = None,
+    ) -> WorkItemActivity:
+        """Append an auditable history event for a work item."""
+        activity = WorkItemActivity(
+            work_item_id=work_item_id,
+            user_id=user_id,
+            field=field,
+            old_value=str(old_value) if old_value is not None else None,
+            new_value=str(new_value) if new_value is not None else None,
+        )
+        self.session.add(activity)
+        await self.session.flush()
+        return activity
+
+    async def list_activities_for_task(
+        self,
+        work_item_id: uuid.UUID,
+        skip: int = 0,
+        limit: int = 25,
+    ) -> tuple[list[WorkItemActivity], int]:
+        """List paginated audit activities for a specific work item."""
+        count_stmt = select(func.count(WorkItemActivity.id)).where(
+            WorkItemActivity.work_item_id == work_item_id
+        )
+        total_res = await self.session.execute(count_stmt)
+        total = int(total_res.scalar_one() or 0)
+
+        stmt = (
+            select(WorkItemActivity)
+            .options(selectinload(WorkItemActivity.user))
+            .where(WorkItemActivity.work_item_id == work_item_id)
+            .order_by(WorkItemActivity.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all()), total

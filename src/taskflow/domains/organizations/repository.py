@@ -1,10 +1,15 @@
 import uuid
+from datetime import datetime
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from taskflow.domains.organizations.models import Organization, OrganizationMembership
+from taskflow.domains.organizations.models import (
+    Invitation,
+    Organization,
+    OrganizationMembership,
+)
 
 
 class OrganizationRepository:
@@ -92,6 +97,43 @@ class OrganizationRepository:
         result = await self.session.execute(stmt)
         return int(result.scalar_one() or 0)
 
+    async def list_user_organizations(
+        self,
+        user_id: uuid.UUID,
+        skip: int = 0,
+        limit: int = 25,
+    ) -> tuple[list[Organization], int]:
+        """List organizations that the user belongs to with pagination."""
+        base_query = (
+            select(Organization)
+            .join(
+                OrganizationMembership,
+                OrganizationMembership.organization_id == Organization.id,
+            )
+            .where(
+                OrganizationMembership.user_id == user_id,
+                OrganizationMembership.is_active == True,  # noqa: E712
+            )
+        )
+        count_query = (
+            select(func.count(Organization.id))
+            .join(
+                OrganizationMembership,
+                OrganizationMembership.organization_id == Organization.id,
+            )
+            .where(
+                OrganizationMembership.user_id == user_id,
+                OrganizationMembership.is_active == True,  # noqa: E712
+            )
+        )
+
+        total_res = await self.session.execute(count_query)
+        total = int(total_res.scalar_one() or 0)
+
+        stmt = base_query.order_by(Organization.created_at.desc()).offset(skip).limit(limit)
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all()), total
+
     # ---------------- Membership operations ---------------- #
 
     async def get_membership(
@@ -121,16 +163,29 @@ class OrganizationRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def list_memberships(self, org_id: uuid.UUID) -> list[OrganizationMembership]:
-        """List all memberships in an organization with user loaded."""
+    async def list_memberships(
+        self,
+        org_id: uuid.UUID,
+        skip: int = 0,
+        limit: int = 25,
+    ) -> tuple[list[OrganizationMembership], int]:
+        """List memberships in an organization with user loaded and pagination."""
+        count_stmt = select(func.count(OrganizationMembership.id)).where(
+            OrganizationMembership.organization_id == org_id
+        )
+        total_res = await self.session.execute(count_stmt)
+        total = int(total_res.scalar_one() or 0)
+
         stmt = (
             select(OrganizationMembership)
             .options(selectinload(OrganizationMembership.user))
             .where(OrganizationMembership.organization_id == org_id)
             .order_by(OrganizationMembership.created_at.asc())
+            .offset(skip)
+            .limit(limit)
         )
         result = await self.session.execute(stmt)
-        return list(result.scalars().all())
+        return list(result.scalars().all()), total
 
     async def add_membership(
         self,
@@ -185,3 +240,56 @@ class OrganizationRepository:
         )
         result = await self.session.execute(stmt)
         return int(result.scalar_one() or 0)
+
+    # ---------------- Invitation operations ---------------- #
+
+    async def create_invitation(
+        self,
+        org_id: uuid.UUID,
+        email: str,
+        role: str,
+        token: str,
+        invited_by_id: uuid.UUID | None,
+        expires_at: datetime,
+    ) -> Invitation:
+        """Create and persist a new invitation."""
+        invitation = Invitation(
+            organization_id=org_id,
+            email=email.strip().lower(),
+            role=role,
+            token=token,
+            invited_by_id=invited_by_id,
+            expires_at=expires_at,
+        )
+        self.session.add(invitation)
+        await self.session.flush()
+        return invitation
+
+    async def get_invitation_by_token(self, token: str) -> Invitation | None:
+        """Fetch invitation by unique token."""
+        stmt = select(Invitation).where(Invitation.token == token)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_active_invitation_by_email(
+        self, org_id: uuid.UUID, email: str
+    ) -> Invitation | None:
+        """Fetch pending invitation for an email in an organization."""
+        stmt = select(Invitation).where(
+            Invitation.organization_id == org_id,
+            Invitation.email == email.strip().lower(),
+            Invitation.accepted_at.is_(None),
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_invitations(
+        self, org_id: uuid.UUID, pending_only: bool = True
+    ) -> list[Invitation]:
+        """List invitations for an organization."""
+        stmt = select(Invitation).where(Invitation.organization_id == org_id)
+        if pending_only:
+            stmt = stmt.where(Invitation.accepted_at.is_(None))
+        stmt = stmt.order_by(Invitation.created_at.desc())
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())

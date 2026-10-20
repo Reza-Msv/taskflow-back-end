@@ -264,9 +264,13 @@ async def list_organization_members_admin(
     organization_id: uuid.UUID,
     _: Annotated[User, Depends(require_superuser)],
     org_service: Annotated[OrganizationService, Depends(get_organization_service)],
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(25, ge=1, le=100, description="Items per page"),
 ) -> OrganizationMembershipListResponse:
     """List all members and their roles for an organization."""
-    memberships = await org_service.list_memberships(organization_id)
+    memberships, total = await org_service.list_memberships(
+        organization_id, page=page, page_size=page_size
+    )
     items = []
     for m in memberships:
         user_dto = UserResponse.model_validate(m.user) if m.user else None
@@ -282,7 +286,9 @@ async def list_organization_members_admin(
                 user=user_dto,
             )
         )
-    return OrganizationMembershipListResponse(items=items, total=len(items))
+    return OrganizationMembershipListResponse(
+        items=items, page=page, page_size=page_size, total=total
+    )
 
 
 @router.post(
