@@ -288,6 +288,7 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
     sprint: Mapped["Sprint | None"] = relationship(
         "Sprint",
         foreign_keys=[sprint_id],
+        back_populates="work_items",
     )
     labels: Mapped[list["Label"]] = relationship(
         "Label",

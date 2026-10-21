@@ -648,6 +648,7 @@ class TaskService:
             reporter_id=creator_id,
             assignee_id=request.assignee_id,
             parent_id=request.parent_id,
+            sprint_id=request.sprint_id,
             due_date=request.due_date,
             estimated_points=request.estimated_points,
             rank=rank_val,
@@ -879,6 +880,30 @@ class TaskService:
                 str(request.estimated_points),
             )
             task.estimated_points = request.estimated_points
+            mutated = True
+
+        if "sprint_id" in request.model_fields_set and request.sprint_id != task.sprint_id:
+            old_sprint_val = str(task.sprint_id) if task.sprint_id else None
+            new_sprint_val = str(request.sprint_id) if request.sprint_id else None
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "sprint_id",
+                old_sprint_val,
+                new_sprint_val,
+            )
+            task.sprint_id = request.sprint_id
+            mutated = True
+
+        if request.rank is not None and request.rank != task.rank:
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "rank",
+                task.rank,
+                request.rank,
+            )
+            task.rank = request.rank
             mutated = True
 
         if mutated:

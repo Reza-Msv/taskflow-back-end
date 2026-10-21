@@ -16,6 +16,7 @@ from taskflow.api.v1.endpoints.projects import router as projects_router
 from taskflow.api.v1.endpoints.saved_filters import (
     router as saved_filters_router,
 )
+from taskflow.api.v1.endpoints.scrum import router as scrum_router
 from taskflow.api.v1.endpoints.search import router as search_router
 from taskflow.api.v1.endpoints.tasks import router as tasks_router
 from taskflow.core.config import settings
@@ -28,6 +29,7 @@ router.include_router(my_tasks_router)
 router.include_router(organizations_router)
 router.include_router(projects_router)
 router.include_router(tasks_router)
+router.include_router(scrum_router)
 router.include_router(notifications_router)
 router.include_router(search_router)
 router.include_router(saved_filters_router)

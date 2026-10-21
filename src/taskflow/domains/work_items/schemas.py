@@ -242,6 +242,10 @@ class WorkItemCreateRequest(BaseModel):
         ge=0,
         description="Story points estimate",
     )
+    sprint_id: uuid.UUID | None = Field(
+        default=None,
+        description="Assigned sprint ID",
+    )
     rank: str | None = Field(
         default=None,
         description="Custom rank string for relative ordering",
@@ -281,6 +285,14 @@ class WorkItemUpdateRequest(BaseModel):
         default=None,
         ge=0,
         description="Updated story points estimate",
+    )
+    sprint_id: uuid.UUID | None = Field(
+        default=None,
+        description="Updated sprint ID (or null to unassign)",
+    )
+    rank: str | None = Field(
+        default=None,
+        description="Updated relative rank string",
     )
     version: int | None = Field(
         default=None,

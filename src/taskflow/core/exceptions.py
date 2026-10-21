@@ -44,6 +44,12 @@ async def validation_exception_handler(
 ) -> JSONResponse:
     request_id = getattr(request.state, "request_id", "req_unknown")
     errors = getattr(exc, "errors", lambda: str(exc))()
+    if isinstance(errors, list):
+        for err in errors:
+            if isinstance(err, dict) and "ctx" in err and isinstance(err["ctx"], dict):
+                for k, v in list(err["ctx"].items()):
+                    if isinstance(v, Exception):
+                        err["ctx"][k] = str(v)
     return JSONResponse(
         status_code=getattr(
             status,
