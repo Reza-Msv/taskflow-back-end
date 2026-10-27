@@ -188,6 +188,9 @@ class WorkItemResponse(BaseModel):
     milestone_id: uuid.UUID | None = Field(
         default=None, description="Associated milestone ID"
     )
+    completed_at: datetime | None = Field(
+        default=None, description="Completion timestamp (UTC)"
+    )
     estimated_points: float | None = Field(
         default=None, description="Story points estimate"
     )

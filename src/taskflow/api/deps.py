@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from taskflow.domains.collaboration.service import CollaborationService
     from taskflow.domains.organizations.service import OrganizationService
     from taskflow.domains.projects.service import ProjectService
+    from taskflow.domains.reports.service import ReportService
     from taskflow.domains.scrum.service import ScrumService
     from taskflow.domains.work_items.service import (
         DashboardService,
@@ -96,6 +97,15 @@ def get_scrum_service(
     from taskflow.domains.scrum.service import ScrumService
 
     return ScrumService(session)
+
+
+def get_report_service(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> "ReportService":
+    """Dependency injecting ReportService with active DB session."""
+    from taskflow.domains.reports.service import ReportService
+
+    return ReportService(session)
 
 
 class SessionCredentials:

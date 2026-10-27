@@ -658,3 +658,49 @@ async def test_milestone_and_task_dependency_persistence_and_relationships(
     assert loaded_t1.successor_dependencies[0].successor_id == t2.id
     assert len(loaded_t1.predecessor_dependencies) == 0
 
+
+@pytest.mark.asyncio
+async def test_work_item_completed_at_persistence(
+    db_session: AsyncSession,
+):
+    """Verify WorkItem completed_at column persistence and indexing."""
+    user = User(
+        email="comp_tester@taskflow.dev",
+        full_name="Completed Tester",
+    )
+    org = Organization(
+        name="Comp Corp",
+        slug="comp-corp",
+    )
+    db_session.add_all([user, org])
+    await db_session.flush()
+
+    project = Project(
+        organization_id=org.id,
+        name="Comp Project",
+        key="CMP",
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    now_utc = datetime.now(UTC)
+    t = WorkItem(
+        project_id=project.id,
+        organization_id=org.id,
+        sequence_number=1,
+        issue_key="CMP-1",
+        title="Completed Task",
+        status="done",
+        completed_at=now_utc,
+    )
+    db_session.add(t)
+    await db_session.commit()
+
+    stmt = select(WorkItem).where(WorkItem.id == t.id)
+    res = await db_session.execute(stmt)
+    loaded = res.scalar_one()
+
+    assert loaded.completed_at is not None
+    assert loaded.status == "done"
+
+

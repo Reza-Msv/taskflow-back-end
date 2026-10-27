@@ -698,6 +698,9 @@ class TaskService:
             rank=rank_val,
         )
 
+        if initial_status.lower() in COMPLETED_STATUSES:
+            task.completed_at = datetime.now(UTC)
+
         # Audit creation event in same transaction
         await self.work_item_repo.record_activity(
             work_item_id=task.id,
@@ -1200,6 +1203,10 @@ class TaskService:
                 new_status_name,
             )
             task.status = new_status_name
+            if new_status_name.lower() in COMPLETED_STATUSES:
+                task.completed_at = datetime.now(UTC)
+            else:
+                task.completed_at = None
 
             status_notifications: list[Notification] = []
             notified_users: set[uuid.UUID] = {actor_id}
