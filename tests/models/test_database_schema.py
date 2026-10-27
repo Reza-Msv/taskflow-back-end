@@ -29,7 +29,9 @@ from taskflow.domains.scrum.models import (
 from taskflow.domains.work_items.models import (
     Attachment,
     Label,
+    Milestone,
     SavedFilter,
+    TaskDependency,
     WorkflowStatus,
     WorkflowTransition,
     WorkItem,
@@ -557,3 +559,102 @@ async def test_saved_filter_persistence_and_cascades(
     assert loaded.filter_criteria == {"status": "todo", "priority": "high"}
     assert loaded.is_favorite is True
     assert loaded.created_at is not None
+
+
+@pytest.mark.asyncio
+async def test_milestone_and_task_dependency_persistence_and_relationships(
+    db_session: AsyncSession,
+):
+    """Verify Milestone and TaskDependency model persistence and relationships."""
+    user = User(
+        email="m_dep_owner@taskflow.dev",
+        full_name="Milestone Dep Owner",
+    )
+    org = Organization(
+        name="Milestone Dep Org",
+        slug="m-dep-org-schema",
+    )
+    db_session.add_all([user, org])
+    await db_session.flush()
+
+    project = Project(
+        organization_id=org.id,
+        name="Milestone Dep Project",
+        key="MDP",
+        owner_id=user.id,
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    # 1. Milestone
+    target_dt = datetime(2026, 12, 1, 0, 0, 0, tzinfo=UTC)
+    milestone = Milestone(
+        project_id=project.id,
+        name="Release v1.0",
+        description="Production launch",
+        target_date=target_dt,
+        is_completed=False,
+    )
+    db_session.add(milestone)
+    await db_session.flush()
+
+    # 2. Tasks with scheduling fields
+    t1 = WorkItem(
+        project_id=project.id,
+        organization_id=org.id,
+        sequence_number=1,
+        issue_key="MDP-1",
+        title="First Task",
+        type="task",
+        priority="high",
+        status="todo",
+        reporter_id=user.id,
+        start_date=datetime(2026, 11, 1, 0, 0, 0, tzinfo=UTC),
+        due_date=datetime(2026, 11, 15, 0, 0, 0, tzinfo=UTC),
+        milestone_id=milestone.id,
+    )
+    t2 = WorkItem(
+        project_id=project.id,
+        organization_id=org.id,
+        sequence_number=2,
+        issue_key="MDP-2",
+        title="Second Task",
+        type="task",
+        priority="medium",
+        status="todo",
+        reporter_id=user.id,
+        start_date=datetime(2026, 11, 16, 0, 0, 0, tzinfo=UTC),
+        due_date=datetime(2026, 11, 30, 0, 0, 0, tzinfo=UTC),
+    )
+    db_session.add_all([t1, t2])
+    await db_session.flush()
+
+    # 3. TaskDependency: t1 -> t2
+    dep = TaskDependency(
+        project_id=project.id,
+        predecessor_id=t1.id,
+        successor_id=t2.id,
+        dependency_type="finish_to_start",
+    )
+    db_session.add(dep)
+    await db_session.commit()
+
+    # 4. Verify relationships
+    stmt = (
+        select(WorkItem)
+        .options(
+            selectinload(WorkItem.milestone),
+            selectinload(WorkItem.successor_dependencies),
+            selectinload(WorkItem.predecessor_dependencies),
+        )
+        .where(WorkItem.id == t1.id)
+    )
+    res = await db_session.execute(stmt)
+    loaded_t1 = res.scalar_one()
+
+    assert loaded_t1.milestone is not None
+    assert loaded_t1.milestone.name == "Release v1.0"
+    assert len(loaded_t1.successor_dependencies) == 1
+    assert loaded_t1.successor_dependencies[0].successor_id == t2.id
+    assert len(loaded_t1.predecessor_dependencies) == 0
+

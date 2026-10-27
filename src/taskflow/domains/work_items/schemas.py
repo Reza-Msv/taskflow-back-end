@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ProjectBrief(BaseModel):
@@ -182,6 +182,12 @@ class WorkItemResponse(BaseModel):
     due_date: datetime | None = Field(
         default=None, description="Due date timestamp (UTC)"
     )
+    start_date: datetime | None = Field(
+        default=None, description="Start date timestamp (UTC)"
+    )
+    milestone_id: uuid.UUID | None = Field(
+        default=None, description="Associated milestone ID"
+    )
     estimated_points: float | None = Field(
         default=None, description="Story points estimate"
     )
@@ -233,9 +239,17 @@ class WorkItemCreateRequest(BaseModel):
         default=None,
         description="Parent work item ID (for subtasks)",
     )
+    start_date: datetime | None = Field(
+        default=None,
+        description="Planned start date timestamp (UTC)",
+    )
     due_date: datetime | None = Field(
         default=None,
         description="Due date timestamp (UTC)",
+    )
+    milestone_id: uuid.UUID | None = Field(
+        default=None,
+        description="Associated milestone ID",
     )
     estimated_points: float | None = Field(
         default=None,
@@ -250,6 +264,13 @@ class WorkItemCreateRequest(BaseModel):
         default=None,
         description="Custom rank string for relative ordering",
     )
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "WorkItemCreateRequest":
+        if self.start_date is not None and self.due_date is not None:
+            if self.due_date < self.start_date:
+                raise ValueError("due_date cannot be earlier than start_date")
+        return self
 
 
 class WorkItemUpdateRequest(BaseModel):
@@ -277,9 +298,17 @@ class WorkItemUpdateRequest(BaseModel):
         default=None,
         description="Updated parent work item ID",
     )
+    start_date: datetime | None = Field(
+        default=None,
+        description="Updated start date timestamp (UTC)",
+    )
     due_date: datetime | None = Field(
         default=None,
         description="Updated due date timestamp (UTC)",
+    )
+    milestone_id: uuid.UUID | None = Field(
+        default=None,
+        description="Updated milestone ID (or null to unassign)",
     )
     estimated_points: float | None = Field(
         default=None,
@@ -298,6 +327,13 @@ class WorkItemUpdateRequest(BaseModel):
         default=None,
         description="Optimistic concurrency lock version check",
     )
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "WorkItemUpdateRequest":
+        if self.start_date is not None and self.due_date is not None:
+            if self.due_date < self.start_date:
+                raise ValueError("due_date cannot be earlier than start_date")
+        return self
 
 
 class TaskStatusMoveRequest(BaseModel):
@@ -521,6 +557,163 @@ class SubtaskCreateRequest(BaseModel):
     )
 
 
+# -------------------------------------------------------------
+# Phase 8: Milestones & Task Dependencies Schemas
+# -------------------------------------------------------------
+
+
+class MilestoneBrief(BaseModel):
+    """Compact milestone summary for tasks and timeline views."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique milestone identifier")
+    name: str = Field(..., description="Milestone title")
+    target_date: datetime = Field(
+        ..., description="Target completion timestamp (UTC)"
+    )
+    is_completed: bool = Field(False, description="Completion status")
+
+
+class MilestoneCreateRequest(BaseModel):
+    """Payload for creating a new project milestone."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Milestone name",
+        examples=["Beta Release v1.0"],
+    )
+    description: str | None = Field(
+        default=None,
+        description="Detailed milestone description",
+    )
+    target_date: datetime = Field(
+        ...,
+        description="Target completion timestamp (UTC)",
+    )
+    is_completed: bool = Field(
+        default=False,
+        description="Whether the milestone is initially completed",
+    )
+
+
+class MilestoneUpdateRequest(BaseModel):
+    """Payload for updating an existing milestone."""
+
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="Updated milestone name",
+    )
+    description: str | None = Field(
+        default=None,
+        description="Updated milestone description",
+    )
+    target_date: datetime | None = Field(
+        default=None,
+        description="Updated target completion timestamp (UTC)",
+    )
+    is_completed: bool | None = Field(
+        default=None,
+        description="Updated completion flag",
+    )
+
+
+class MilestoneResponse(BaseModel):
+    """Full milestone representation including task statistics."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique milestone identifier")
+    project_id: uuid.UUID = Field(..., description="Associated project ID")
+    name: str = Field(..., description="Milestone name")
+    description: str | None = Field(
+        default=None, description="Milestone description"
+    )
+    target_date: datetime = Field(
+        ..., description="Target completion timestamp (UTC)"
+    )
+    is_completed: bool = Field(..., description="Whether milestone is completed")
+    total_tasks: int = Field(
+        default=0, description="Total tasks attached to this milestone"
+    )
+    completed_tasks: int = Field(
+        default=0, description="Completed tasks attached to this milestone"
+    )
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    updated_at: datetime = Field(..., description="Last updated timestamp (UTC)")
+
+
+class MilestoneListResponse(BaseModel):
+    """List of project milestones."""
+
+    items: list[MilestoneResponse] = Field(..., description="Milestones")
+    total: int = Field(..., description="Total milestones count")
+
+
+class TaskDependencyCreateRequest(BaseModel):
+    """Payload for establishing a dependency relationship between two tasks."""
+
+    predecessor_id: uuid.UUID = Field(
+        ...,
+        description="Predecessor task ID (must be completed first)",
+    )
+    successor_id: uuid.UUID = Field(
+        ...,
+        description="Successor task ID (dependent task)",
+    )
+    dependency_type: str = Field(
+        default="finish_to_start",
+        description="Relationship type: finish_to_start",
+    )
+
+    @model_validator(mode="after")
+    def validate_no_self_dependency(self) -> "TaskDependencyCreateRequest":
+        if self.predecessor_id == self.successor_id:
+            raise ValueError("A task cannot depend on itself")
+        return self
+
+
+class TaskDependencyResponse(BaseModel):
+    """Task dependency edge response."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique dependency identifier")
+    project_id: uuid.UUID = Field(..., description="Associated project ID")
+    predecessor_id: uuid.UUID = Field(..., description="Predecessor task ID")
+    successor_id: uuid.UUID = Field(..., description="Successor task ID")
+    dependency_type: str = Field(
+        ..., description="Dependency relationship type"
+    )
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+
+
+class TaskDependencyListResponse(BaseModel):
+    """List of project dependencies."""
+
+    items: list[TaskDependencyResponse] = Field(
+        ..., description="Dependencies"
+    )
+    total: int = Field(..., description="Total dependencies count")
+
+
+class TaskDependenciesSummary(BaseModel):
+    """Direct incoming and outgoing dependencies for a specific task."""
+
+    predecessors: list[TaskDependencyResponse] = Field(
+        default_factory=list,
+        description="Tasks that this task depends on",
+    )
+    successors: list[TaskDependencyResponse] = Field(
+        default_factory=list,
+        description="Tasks that depend on this task",
+    )
+
+
 class WorkItemDetailResponse(WorkItemResponse):
     """Comprehensive work item detail response including collaboration context."""
 
@@ -533,6 +726,12 @@ class WorkItemDetailResponse(WorkItemResponse):
     assignee: UserActivityActor | None = Field(
         default=None, description="Assignee user details"
     )
+    milestone: MilestoneBrief | None = Field(
+        default=None, description="Associated milestone details"
+    )
+    dependencies: TaskDependenciesSummary | None = Field(
+        default=None, description="Incoming and outgoing task dependencies"
+    )
     subtasks: list[WorkItemResponse] = Field(
         default_factory=list, description="Child subtasks"
     )
@@ -542,12 +741,18 @@ class WorkItemDetailResponse(WorkItemResponse):
     attachments: list[AttachmentResponse] = Field(
         default_factory=list, description="Attached files"
     )
-    subtasks_count: int = Field(default=0, description="Total child subtasks count")
-    checklists_count: int = Field(default=0, description="Total checklist items count")
+    subtasks_count: int = Field(
+        default=0, description="Total child subtasks count"
+    )
+    checklists_count: int = Field(
+        default=0, description="Total checklist items count"
+    )
     completed_checklists_count: int = Field(
         default=0, description="Completed checklist items count"
     )
-    attachments_count: int = Field(default=0, description="Total attachments count")
+    attachments_count: int = Field(
+        default=0, description="Total attachments count"
+    )
     comments_count: int = Field(default=0, description="Total comments count")
 
 
@@ -699,4 +904,146 @@ class GlobalSearchResponse(BaseModel):
     total_projects: int
     limit: int
     offset: int
+
+
+# -------------------------------------------------------------
+# Phase 8: Calendar & Timeline Views Schemas
+# -------------------------------------------------------------
+
+
+class CalendarTaskItem(BaseModel):
+    """Task item formatted for calendar view rendering."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Task identifier")
+    issue_key: str = Field(..., description="Issue key (e.g. PROJ-12)")
+    type: str = Field(..., description="Task type")
+    title: str = Field(..., description="Task title")
+    status: str = Field(..., description="Status name")
+    priority: str = Field(..., description="Priority")
+    start_date: datetime | None = Field(
+        default=None, description="Start date timestamp (UTC)"
+    )
+    due_date: datetime | None = Field(
+        default=None, description="Due date timestamp (UTC)"
+    )
+    estimated_points: float | None = Field(
+        default=None, description="Story points estimate"
+    )
+    assignee: UserActivityActor | None = Field(
+        default=None, description="Assignee actor"
+    )
+    milestone_id: uuid.UUID | None = Field(
+        default=None, description="Associated milestone ID"
+    )
+    milestone_name: str | None = Field(
+        default=None, description="Associated milestone name"
+    )
+
+
+class CalendarResponse(BaseModel):
+    """Response containing tasks for a calendar date window."""
+
+    items: list[CalendarTaskItem] = Field(
+        default_factory=list,
+        description="Scheduled tasks overlapping or falling within the date range",
+    )
+    unscheduled_items: list[CalendarTaskItem] = Field(
+        default_factory=list,
+        description="Tasks in project without planned start or due date",
+    )
+    total: int = Field(..., description="Total scheduled tasks in requested range")
+    start_date: datetime = Field(
+        ..., description="Query range start timestamp (UTC)"
+    )
+    end_date: datetime = Field(
+        ..., description="Query range end timestamp (UTC)"
+    )
+
+
+class TimelineTaskItem(BaseModel):
+    """Task item tailored for Timeline / Gantt chart scheduling."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Task identifier")
+    issue_key: str = Field(..., description="Issue key")
+    type: str = Field(..., description="Task type")
+    title: str = Field(..., description="Task title")
+    status: str = Field(..., description="Status name")
+    priority: str = Field(..., description="Priority")
+    start_date: datetime | None = Field(
+        default=None, description="Start date timestamp (UTC)"
+    )
+    due_date: datetime | None = Field(
+        default=None, description="Due date timestamp (UTC)"
+    )
+    estimated_points: float | None = Field(
+        default=None, description="Story points estimate"
+    )
+    rank: str = Field(..., description="Relative backlog rank")
+    assignee: UserActivityActor | None = Field(
+        default=None, description="Assignee actor"
+    )
+    milestone_id: uuid.UUID | None = Field(
+        default=None, description="Associated milestone ID"
+    )
+    milestone_name: str | None = Field(
+        default=None, description="Associated milestone name"
+    )
+    has_dates: bool = Field(
+        default=True, description="Whether task has start or due date"
+    )
+
+
+class TimelineMilestoneItem(BaseModel):
+    """Milestone marker for Timeline / Gantt chart."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Milestone identifier")
+    name: str = Field(..., description="Milestone name")
+    description: str | None = Field(
+        default=None, description="Milestone description"
+    )
+    target_date: datetime = Field(
+        ..., description="Target completion timestamp (UTC)"
+    )
+    is_completed: bool = Field(..., description="Whether milestone is completed")
+
+
+class TimelineDependencyItem(BaseModel):
+    """Dependency connection between two tasks on the timeline."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Dependency identifier")
+    predecessor_id: uuid.UUID = Field(..., description="Predecessor task ID")
+    successor_id: uuid.UUID = Field(..., description="Successor task ID")
+    dependency_type: str = Field(
+        default="finish_to_start", description="Dependency type"
+    )
+
+
+class TimelineResponse(BaseModel):
+    """Full Gantt/Timeline view data payload."""
+
+    project: ProjectBrief = Field(..., description="Project details")
+    tasks: list[TimelineTaskItem] = Field(
+        default_factory=list, description="Project tasks"
+    )
+    milestones: list[TimelineMilestoneItem] = Field(
+        default_factory=list, description="Project milestones"
+    )
+    dependencies: list[TimelineDependencyItem] = Field(
+        default_factory=list, description="Task dependencies"
+    )
+    start_date: datetime | None = Field(
+        default=None, description="Timeline view window start if specified"
+    )
+    end_date: datetime | None = Field(
+        default=None, description="Timeline view window end if specified"
+    )
+
 

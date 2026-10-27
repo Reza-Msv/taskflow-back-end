@@ -12,7 +12,9 @@ from taskflow.domains.projects.models import Project, ProjectMembership, Project
 from taskflow.domains.work_items.models import (
     Attachment,
     ChecklistItem,
+    Milestone,
     SavedFilter,
+    TaskDependency,
     WorkflowStatus,
     WorkflowTransition,
     WorkItem,
@@ -595,6 +597,8 @@ class WorkItemRepository:
         parent_id: uuid.UUID | None = None,
         sprint_id: uuid.UUID | None = None,
         due_date: datetime | None = None,
+        start_date: datetime | None = None,
+        milestone_id: uuid.UUID | None = None,
         estimated_points: float | None = None,
         rank: str = "0|hzzzzz:",
     ) -> WorkItem:
@@ -614,6 +618,8 @@ class WorkItemRepository:
             parent_id=parent_id,
             sprint_id=sprint_id,
             due_date=due_date,
+            start_date=start_date,
+            milestone_id=milestone_id,
             estimated_points=estimated_points,
             rank=rank,
             version=1,
@@ -992,6 +998,9 @@ class WorkItemRepository:
                 selectinload(WorkItem.project),
                 selectinload(WorkItem.assignee),
                 selectinload(WorkItem.reporter),
+                selectinload(WorkItem.milestone),
+                selectinload(WorkItem.predecessor_dependencies),
+                selectinload(WorkItem.successor_dependencies),
                 selectinload(WorkItem.checklists).selectinload(ChecklistItem.assignee),
                 selectinload(WorkItem.attachments).selectinload(Attachment.uploader),
                 selectinload(WorkItem.children).selectinload(WorkItem.assignee),
@@ -1275,6 +1284,351 @@ class WorkItemRepository:
         res = await self.session.execute(stmt)
         rows = res.all()
         return [(proj, matched_field) for proj, matched_field in rows], total
+
+    # -------------------------------------------------------------
+    # Phase 8: Calendar & Timeline Views
+    # -------------------------------------------------------------
+
+    async def get_calendar_tasks(
+        self,
+        project_id: uuid.UUID,
+        start_date: datetime,
+        end_date: datetime,
+        assignee_id: uuid.UUID | None = None,
+        status: str | None = None,
+        include_unscheduled: bool = False,
+    ) -> tuple[list[WorkItem], list[WorkItem]]:
+        """Fetch tasks in calendar date window with eager-loaded relations."""
+        base_conditions = [WorkItem.project_id == project_id]
+        if assignee_id is not None:
+            base_conditions.append(WorkItem.assignee_id == assignee_id)
+        if status is not None:
+            base_conditions.append(WorkItem.status == status)
+
+        date_overlap_condition = or_(
+            and_(
+                WorkItem.start_date.isnot(None),
+                WorkItem.due_date.isnot(None),
+                WorkItem.start_date <= end_date,
+                WorkItem.due_date >= start_date,
+            ),
+            and_(
+                WorkItem.start_date.isnot(None),
+                WorkItem.due_date.is_(None),
+                WorkItem.start_date >= start_date,
+                WorkItem.start_date <= end_date,
+            ),
+            and_(
+                WorkItem.start_date.is_(None),
+                WorkItem.due_date.isnot(None),
+                WorkItem.due_date >= start_date,
+                WorkItem.due_date <= end_date,
+            ),
+        )
+
+        scheduled_stmt = (
+            select(WorkItem)
+            .options(
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.milestone),
+            )
+            .where(*base_conditions, date_overlap_condition)
+            .order_by(
+                func.coalesce(WorkItem.start_date, WorkItem.due_date).asc(),
+                WorkItem.id.asc(),
+            )
+        )
+        scheduled_res = await self.session.execute(scheduled_stmt)
+        scheduled_tasks = list(scheduled_res.scalars().all())
+
+        unscheduled_tasks: list[WorkItem] = []
+        if include_unscheduled:
+            unscheduled_stmt = (
+                select(WorkItem)
+                .options(
+                    selectinload(WorkItem.assignee),
+                    selectinload(WorkItem.milestone),
+                )
+                .where(
+                    *base_conditions,
+                    WorkItem.start_date.is_(None),
+                    WorkItem.due_date.is_(None),
+                )
+                .order_by(WorkItem.rank.asc(), WorkItem.id.asc())
+            )
+            unscheduled_res = await self.session.execute(unscheduled_stmt)
+            unscheduled_tasks = list(unscheduled_res.scalars().all())
+
+        return scheduled_tasks, unscheduled_tasks
+
+    async def get_timeline_data(
+        self,
+        project_id: uuid.UUID,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        include_unscheduled: bool = True,
+    ) -> tuple[list[WorkItem], list[Milestone], list[TaskDependency]]:
+        """Batch fetch tasks, milestones, and dependencies for Timeline/Gantt view."""
+        conditions = [WorkItem.project_id == project_id]
+        if start_date is not None and end_date is not None:
+            if not include_unscheduled:
+                conditions.append(
+                    or_(
+                        and_(
+                            WorkItem.start_date.isnot(None),
+                            WorkItem.due_date.isnot(None),
+                            WorkItem.start_date <= end_date,
+                            WorkItem.due_date >= start_date,
+                        ),
+                        and_(
+                            WorkItem.start_date.isnot(None),
+                            WorkItem.due_date.is_(None),
+                            WorkItem.start_date >= start_date,
+                            WorkItem.start_date <= end_date,
+                        ),
+                        and_(
+                            WorkItem.start_date.is_(None),
+                            WorkItem.due_date.isnot(None),
+                            WorkItem.due_date >= start_date,
+                            WorkItem.due_date <= end_date,
+                        ),
+                    )
+                )
+
+        sort_date = func.coalesce(WorkItem.start_date, WorkItem.due_date)
+        task_stmt = (
+            select(WorkItem)
+            .options(
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.milestone),
+            )
+            .where(*conditions)
+            .order_by(
+                sort_date.asc().nulls_last(),
+                WorkItem.rank.asc(),
+            )
+        )
+        task_res = await self.session.execute(task_stmt)
+        tasks = list(task_res.scalars().all())
+
+        milestone_conditions = [Milestone.project_id == project_id]
+        if start_date is not None and end_date is not None:
+            milestone_conditions.append(
+                and_(
+                    Milestone.target_date >= start_date,
+                    Milestone.target_date <= end_date,
+                )
+            )
+        milestone_stmt = (
+            select(Milestone)
+            .where(*milestone_conditions)
+            .order_by(Milestone.target_date.asc())
+        )
+        milestone_res = await self.session.execute(milestone_stmt)
+        milestones = list(milestone_res.scalars().all())
+
+        dep_stmt = (
+            select(TaskDependency)
+            .where(TaskDependency.project_id == project_id)
+            .order_by(TaskDependency.created_at.asc())
+        )
+        dep_res = await self.session.execute(dep_stmt)
+        dependencies = list(dep_res.scalars().all())
+
+        return tasks, milestones, dependencies
+
+    # -------------------------------------------------------------
+    # Phase 8: Milestones Persistence
+    # -------------------------------------------------------------
+
+    async def create_milestone(
+        self,
+        project_id: uuid.UUID,
+        name: str,
+        target_date: datetime,
+        description: str | None = None,
+        is_completed: bool = False,
+    ) -> Milestone:
+        milestone = Milestone(
+            project_id=project_id,
+            name=name,
+            description=description,
+            target_date=target_date,
+            is_completed=is_completed,
+        )
+        self.session.add(milestone)
+        await self.session.flush()
+        return milestone
+
+    async def get_milestone_by_id(
+        self, milestone_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> Milestone | None:
+        stmt = select(Milestone).where(Milestone.id == milestone_id)
+        if project_id is not None:
+            stmt = stmt.where(Milestone.project_id == project_id)
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def get_milestone_by_name(
+        self, project_id: uuid.UUID, name: str
+    ) -> Milestone | None:
+        stmt = select(Milestone).where(
+            Milestone.project_id == project_id,
+            func.lower(Milestone.name) == name.strip().lower(),
+        )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def list_milestones(
+        self,
+        project_id: uuid.UUID,
+        is_completed: bool | None = None,
+    ) -> list[Milestone]:
+        stmt = select(Milestone).where(Milestone.project_id == project_id)
+        if is_completed is not None:
+            stmt = stmt.where(Milestone.is_completed == is_completed)
+        stmt = stmt.order_by(Milestone.target_date.asc(), Milestone.name.asc())
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def get_milestone_task_counts(
+        self, project_id: uuid.UUID
+    ) -> dict[uuid.UUID, tuple[int, int]]:
+        """Returns dict mapping milestone_id -> (total_tasks, completed_tasks)."""
+        stmt = (
+            select(
+                WorkItem.milestone_id,
+                func.count(WorkItem.id).label("total"),
+                func.count(
+                    case((WorkItem.status.in_(COMPLETED_STATUSES), 1))
+                ).label("completed"),
+            )
+            .where(
+                WorkItem.project_id == project_id,
+                WorkItem.milestone_id.isnot(None),
+            )
+            .group_by(WorkItem.milestone_id)
+        )
+        res = await self.session.execute(stmt)
+        counts: dict[uuid.UUID, tuple[int, int]] = {}
+        for row in res.all():
+            m_id = row[0]
+            if m_id is not None:
+                counts[m_id] = (int(row[1]), int(row[2]))
+        return counts
+
+    async def delete_milestone(self, milestone: Milestone) -> None:
+        await self.session.delete(milestone)
+        await self.session.flush()
+
+    # -------------------------------------------------------------
+    # Phase 8: Task Dependencies Persistence
+    # -------------------------------------------------------------
+
+    async def create_dependency(
+        self,
+        project_id: uuid.UUID,
+        predecessor_id: uuid.UUID,
+        successor_id: uuid.UUID,
+        dependency_type: str = "finish_to_start",
+    ) -> TaskDependency:
+        dep = TaskDependency(
+            project_id=project_id,
+            predecessor_id=predecessor_id,
+            successor_id=successor_id,
+            dependency_type=dependency_type,
+        )
+        self.session.add(dep)
+        await self.session.flush()
+        return dep
+
+    async def get_dependency_by_id(
+        self, dependency_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> TaskDependency | None:
+        stmt = select(TaskDependency).where(TaskDependency.id == dependency_id)
+        if project_id is not None:
+            stmt = stmt.where(TaskDependency.project_id == project_id)
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def get_dependency_by_nodes(
+        self, predecessor_id: uuid.UUID, successor_id: uuid.UUID
+    ) -> TaskDependency | None:
+        stmt = select(TaskDependency).where(
+            TaskDependency.predecessor_id == predecessor_id,
+            TaskDependency.successor_id == successor_id,
+        )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def list_dependencies_for_project(
+        self, project_id: uuid.UUID
+    ) -> list[TaskDependency]:
+        stmt = (
+            select(TaskDependency)
+            .where(TaskDependency.project_id == project_id)
+            .order_by(TaskDependency.created_at.asc())
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def list_dependencies_for_task(
+        self, task_id: uuid.UUID
+    ) -> tuple[list[TaskDependency], list[TaskDependency]]:
+        pred_stmt = (
+            select(TaskDependency)
+            .where(TaskDependency.successor_id == task_id)
+            .order_by(TaskDependency.created_at.asc())
+        )
+        succ_stmt = (
+            select(TaskDependency)
+            .where(TaskDependency.predecessor_id == task_id)
+            .order_by(TaskDependency.created_at.asc())
+        )
+        pred_res = await self.session.execute(pred_stmt)
+        succ_res = await self.session.execute(succ_stmt)
+        return list(pred_res.scalars().all()), list(succ_res.scalars().all())
+
+    async def check_circular_dependency(
+        self,
+        project_id: uuid.UUID,
+        predecessor_id: uuid.UUID,
+        successor_id: uuid.UUID,
+    ) -> bool:
+        """
+        Detects if adding edge `predecessor_id -> successor_id` creates a cycle.
+        Returns True if `predecessor_id` is reachable from `successor_id`.
+        """
+        if predecessor_id == successor_id:
+            return True
+
+        stmt = select(
+            TaskDependency.predecessor_id, TaskDependency.successor_id
+        ).where(TaskDependency.project_id == project_id)
+        res = await self.session.execute(stmt)
+        edges = res.all()
+
+        adj: dict[uuid.UUID, list[uuid.UUID]] = {}
+        for p, s in edges:
+            adj.setdefault(p, []).append(s)
+
+        queue = [successor_id]
+        visited = {successor_id}
+
+        while queue:
+            curr = queue.pop(0)
+            if curr == predecessor_id:
+                return True
+            for neighbor in adj.get(curr, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+
+        return False
+
+    async def delete_dependency(self, dependency: TaskDependency) -> None:
+        await self.session.delete(dependency)
+        await self.session.flush()
 
 
 class SavedFilterRepository:
