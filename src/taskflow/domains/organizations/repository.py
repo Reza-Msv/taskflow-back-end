@@ -559,31 +559,40 @@ class OrganizationRepository:
     # ---------------- Workspace Stats & Ownership ---------------- #
 
     async def get_workspace_stats(self, org_id: uuid.UUID) -> dict[str, int]:
-        """Aggregate workspace metrics in single-pass queries."""
-        member_cnt_q = select(func.count(OrganizationMembership.id)).where(
-            OrganizationMembership.organization_id == org_id,
-            OrganizationMembership.is_active == True,  # noqa: E712
+        """Aggregate workspace metrics in a single database roundtrip."""
+        stmt = select(
+            select(func.count(OrganizationMembership.id))
+            .where(
+                OrganizationMembership.organization_id == org_id,
+                OrganizationMembership.is_active == True,  # noqa: E712
+            )
+            .scalar_subquery()
+            .label("member_count"),
+            select(func.count(OrganizationMembership.id))
+            .where(
+                OrganizationMembership.organization_id == org_id,
+                OrganizationMembership.role == "owner",
+                OrganizationMembership.is_active == True,  # noqa: E712
+            )
+            .scalar_subquery()
+            .label("active_owners_count"),
+            select(func.count(Team.id))
+            .where(Team.organization_id == org_id)
+            .scalar_subquery()
+            .label("team_count"),
+            select(func.count(Project.id))
+            .where(Project.organization_id == org_id)
+            .scalar_subquery()
+            .label("project_count"),
         )
-        owner_cnt_q = select(func.count(OrganizationMembership.id)).where(
-            OrganizationMembership.organization_id == org_id,
-            OrganizationMembership.role == "owner",
-            OrganizationMembership.is_active == True,  # noqa: E712
-        )
-        team_cnt_q = select(func.count(Team.id)).where(Team.organization_id == org_id)
-        proj_cnt_q = select(func.count(Project.id)).where(
-            Project.organization_id == org_id
-        )
-
-        member_res = await self.session.execute(member_cnt_q)
-        owner_res = await self.session.execute(owner_cnt_q)
-        team_res = await self.session.execute(team_cnt_q)
-        proj_res = await self.session.execute(proj_cnt_q)
+        res = await self.session.execute(stmt)
+        row = res.one()
 
         return {
-            "member_count": int(member_res.scalar_one() or 0),
-            "active_owners_count": int(owner_res.scalar_one() or 0),
-            "team_count": int(team_res.scalar_one() or 0),
-            "project_count": int(proj_res.scalar_one() or 0),
+            "member_count": int(row.member_count or 0),
+            "active_owners_count": int(row.active_owners_count or 0),
+            "team_count": int(row.team_count or 0),
+            "project_count": int(row.project_count or 0),
         }
 
     async def transfer_ownership(

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -52,13 +52,14 @@ class UserCredentials(Base, UUIDMixin, TimestampMixin):
     """Secure password credentials for local authentication."""
 
     __tablename__ = "user_credentials"
+    __table_args__ = (
+        Index("ix_user_credentials_user_id", "user_id", unique=True),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
-        unique=True,
         nullable=False,
-        index=True,
     )
     password_hash: Mapped[str] = mapped_column(
         String(255),

@@ -2,7 +2,15 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -142,6 +150,11 @@ class Notification(Base, UUIDMixin, TimestampMixin):
         default=False,
         nullable=False,
         index=True,
+    )
+
+    __table_args__ = (
+        Index("ix_notifications_user_unread", "user_id", "is_read"),
+        Index("ix_notifications_user_created", "user_id", "created_at"),
     )
 
     user: Mapped["User"] = relationship(

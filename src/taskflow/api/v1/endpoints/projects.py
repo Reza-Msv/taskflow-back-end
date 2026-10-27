@@ -54,15 +54,22 @@ async def verify_project_access(
 ) -> ProjectMembership | None:
     """
     Verify access to a project:
-    - If user is org owner/admin, full access is granted.
+    - If user is org owner/admin or project owner, access is granted immediately.
     - If project is public, access is granted.
-    - If project is private, user must be the project owner or explicit member.
+    - If project is private, user must be an explicit member.
     Returns ProjectMembership if found, else None.
     """
     is_org_admin = org_membership.role in {"owner", "admin"}
-    proj_membership = await project_service.project_repo.get_membership(project.id, user_id)
+    is_project_owner = project.owner_id == user_id
 
-    if is_org_admin or project.owner_id == user_id or proj_membership is not None:
+    # Org admins and project owners have inherent full access; avoid redundant DB lookup
+    if is_org_admin or is_project_owner:
+        return None
+
+    proj_membership = await project_service.project_repo.get_membership(
+        project.id, user_id
+    )
+    if proj_membership is not None:
         return proj_membership
 
     if not project.is_private:

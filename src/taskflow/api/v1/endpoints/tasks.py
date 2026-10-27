@@ -530,6 +530,39 @@ async def list_mentionable_members(
     )
 
 
+@router.get(
+    "/tasks/{task_id}/mentionable-members",
+    response_model=list[MentionableUserResponse],
+    summary="List Mentionable Members for Task Context",
+)
+async def list_task_mentionable_members(
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+    task_id: uuid.UUID,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    org_service: Annotated[OrganizationService, Depends(get_organization_service)],
+    project_service: Annotated[ProjectService, Depends(get_project_service)],
+    collab_service: Annotated[CollaborationService, Depends(get_collaboration_service)],
+    search: str | None = Query(None, description="Optional name or email filter"),
+) -> list[MentionableUserResponse]:
+    """Retrieve users eligible for @-mentions in task comments within project context."""
+    org_membership = await get_org_membership(
+        organization_id, current_user.id, org_service
+    )
+    project = await project_service.get_project_by_id(
+        project_id, org_id=organization_id
+    )
+    await verify_project_access(
+        project, current_user.id, org_membership, project_service
+    )
+
+    return await collab_service.get_mentionable_members(
+        organization_id=organization_id,
+        project_id=project_id,
+        search=search,
+    )
+
+
 # -------------------------------------------------------------
 # Comments Endpoints
 # -------------------------------------------------------------

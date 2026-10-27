@@ -552,9 +552,7 @@ class CollaborationService:
             "is_read": notif.is_read,
             "created_at": notif.created_at.isoformat(),
             "updated_at": notif.updated_at.isoformat(),
-            "actor": (
-                actor_brief.model_dump(mode="json") if actor_brief else None
-            ),
+            "actor": (actor_brief.model_dump(mode="json") if actor_brief else None),
         }
 
     async def list_notifications(
@@ -583,7 +581,6 @@ class CollaborationService:
             total=total,
             unread_count=unread_count,
         )
-
 
     async def get_unread_notification_count(self, user_id: uuid.UUID) -> int:
         """Get count of unread notifications for quick UI badges."""

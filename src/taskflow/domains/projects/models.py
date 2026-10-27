@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -136,13 +137,14 @@ class ProjectSequence(Base, UUIDMixin):
     """
 
     __tablename__ = "project_sequences"
+    __table_args__ = (
+        Index("ix_project_sequences_project_id", "project_id", unique=True),
+    )
 
     project_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("projects.id", ondelete="CASCADE"),
-        unique=True,
         nullable=False,
-        index=True,
     )
     current_sequence: Mapped[int] = mapped_column(
         Integer,

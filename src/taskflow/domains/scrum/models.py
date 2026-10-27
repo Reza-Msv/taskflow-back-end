@@ -2,7 +2,16 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -134,13 +143,14 @@ class SprintRetrospective(Base, UUIDMixin, TimestampMixin):
     """Sprint retrospective review and action items."""
 
     __tablename__ = "sprint_retrospectives"
+    __table_args__ = (
+        Index("ix_sprint_retrospectives_sprint_id", "sprint_id", unique=True),
+    )
 
     sprint_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("sprints.id", ondelete="CASCADE"),
-        unique=True,
         nullable=False,
-        index=True,
     )
     what_went_well: Mapped[str | None] = mapped_column(
         Text,
