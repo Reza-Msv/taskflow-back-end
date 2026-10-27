@@ -1,5 +1,6 @@
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -182,13 +183,20 @@ class CollaborationRepository:
         self,
         user_id: uuid.UUID,
         unread_only: bool = False,
+        since: datetime | None = None,
         skip: int = 0,
         limit: int = 25,
     ) -> tuple[list[Notification], int]:
-        """Fetch paginated notifications for user, newest first."""
+        """
+        Fetch paginated notifications for user, newest first with
+        stable tie-breaking.
+        """
+
         base_filter = [Notification.user_id == user_id]
         if unread_only:
             base_filter.append(Notification.is_read == False)  # noqa: E712
+        if since is not None:
+            base_filter.append(Notification.created_at > since)
 
         count_stmt = select(func.count(Notification.id)).where(and_(*base_filter))
         total = (await self.session.execute(count_stmt)).scalar() or 0
@@ -197,12 +205,13 @@ class CollaborationRepository:
             select(Notification)
             .options(selectinload(Notification.actor))
             .where(and_(*base_filter))
-            .order_by(Notification.created_at.desc())
+            .order_by(Notification.created_at.desc(), Notification.id.desc())
             .offset(skip)
             .limit(limit)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all()), total
+
 
     async def get_unread_count(self, user_id: uuid.UUID) -> int:
         """Return total unread notifications for user."""

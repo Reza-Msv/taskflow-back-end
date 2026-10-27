@@ -215,14 +215,17 @@ async def authenticate_websocket(
     missing, invalid, expired, or belong to an inactive user.
     """
     raw_token: str | None = None
+    token_source: str = "none"
     auth_header = websocket.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         raw_token = auth_header[7:].strip()
+        token_source = "bearer"
 
     if not raw_token:
         cookie_token = websocket.cookies.get(settings.SESSION_COOKIE_NAME)
         if cookie_token:
             raw_token = cookie_token.strip()
+            token_source = "cookie"
 
     if not raw_token:
         await websocket.close(
@@ -230,6 +233,29 @@ async def authenticate_websocket(
             reason="Authentication credentials were not provided.",
         )
         return None
+
+    # Enforce Origin validation for cookie-based authentication to mitigate CSWSH
+    if token_source == "cookie":
+        origin = websocket.headers.get("origin")
+        if origin is not None:
+            allowed_origins = set(settings.BACKEND_CORS_ORIGINS) | {
+                "http://testserver",
+                "https://testserver",
+                "http://localhost",
+                "http://127.0.0.1",
+            }
+            origin_clean = origin.rstrip("/")
+            is_allowed = (
+                "*" in settings.BACKEND_CORS_ORIGINS
+                or origin_clean in allowed_origins
+                or any(origin_clean == o.rstrip("/") for o in allowed_origins)
+            )
+            if not is_allowed:
+                await websocket.close(
+                    code=status.WS_1008_POLICY_VIOLATION,
+                    reason="Origin not allowed.",
+                )
+                return None
 
     auth_service = AuthService(session)
     try:
@@ -242,4 +268,5 @@ async def authenticate_websocket(
         return None
 
     return user
+
 

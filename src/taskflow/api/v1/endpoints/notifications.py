@@ -45,6 +45,14 @@ async def list_notifications(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(25, ge=1, le=100, description="Items per page"),
     unread_only: bool = Query(False, description="Filter only unread notifications"),
+    since: datetime | None = Query(
+        None,
+        description=(
+            "Filter notifications created after this UTC timestamp for "
+            "delta synchronization"
+        ),
+    ),
+
 ) -> NotificationListResponse:
     """Retrieve paginated in-app notifications for the authenticated user."""
     return await collab_service.list_notifications(
@@ -52,6 +60,7 @@ async def list_notifications(
         unread_only=unread_only,
         page=page,
         page_size=page_size,
+        since=since,
     )
 
 
@@ -100,6 +109,9 @@ async def mark_all_notifications_read(
     return MessageResponse(message=f"Marked {count} notifications as read.")
 
 
+MAX_CLIENT_FRAME_BYTES: int = 4096
+
+
 @router.websocket("/ws")
 async def websocket_notifications(
     websocket: WebSocket,
@@ -117,27 +129,57 @@ async def websocket_notifications(
     if user is None:
         return
 
-    await broadcaster.connect(user.id, websocket)
+    connected = await broadcaster.connect(user.id, websocket)
+    if not connected:
+        return
+
     try:
-        # Confirm connection with initial handshake event
+        # Confirm connection with initial handshake event adhering to envelope
+        conn_time = datetime.now(UTC).isoformat()
         await websocket.send_json(
             {
+                "type": "connected",
                 "event": "connected",
+                "event_id": str(uuid.uuid4()),
+                "notification": None,
                 "data": {
                     "user_id": str(user.id),
-                    "timestamp": datetime.now(UTC).isoformat(),
+                    "timestamp": conn_time,
                 },
+                "created_at": conn_time,
+                "timestamp": conn_time,
             }
         )
         while True:
             raw = await websocket.receive_text()
+            if len(raw.encode("utf-8")) > MAX_CLIENT_FRAME_BYTES:
+                logger.warning(
+                    "WebSocket message from user %s exceeded max frame size (%d bytes)",
+                    user.id,
+                    MAX_CLIENT_FRAME_BYTES,
+                )
+                await websocket.close(
+                    code=1009,
+                    reason="Message too large.",
+                )
+                break
+
+
             try:
                 msg = json.loads(raw)
-                if isinstance(msg, dict) and msg.get("event") == "ping":
+                if isinstance(msg, dict) and (
+                    msg.get("event") == "ping" or msg.get("type") == "ping"
+                ):
+                    pong_time = datetime.now(UTC).isoformat()
                     await websocket.send_json(
                         {
+                            "type": "pong",
                             "event": "pong",
-                            "data": {"timestamp": datetime.now(UTC).isoformat()},
+                            "event_id": str(uuid.uuid4()),
+                            "notification": None,
+                            "data": {"timestamp": pong_time},
+                            "created_at": pong_time,
+                            "timestamp": pong_time,
                         }
                     )
             except Exception:
@@ -148,4 +190,5 @@ async def websocket_notifications(
         logger.debug("WebSocket error for user %s: %s", user.id, exc)
     finally:
         await broadcaster.disconnect(user.id, websocket)
+
 

@@ -247,7 +247,13 @@ class ScrumRepository:
         items_res = await self.session.execute(query)
         items = list(items_res.scalars().all())
 
-        return items, int(total_count), float(total_points), int(unestimated_count)
+        return (
+            items,
+            int(total_count or 0),
+            float(total_points or 0.0),
+            int(unestimated_count or 0),
+        )
+
 
     async def list_sprint_tasks(
         self,
