@@ -33,6 +33,8 @@ from taskflow.domains.projects.service import ProjectService
 from taskflow.domains.work_items.schemas import (
     AttachmentListResponse,
     AttachmentResponse,
+    BulkTaskOperationRequest,
+    BulkTaskOperationResponse,
     ChecklistItemCreateRequest,
     ChecklistItemResponse,
     ChecklistItemUpdateRequest,
@@ -161,24 +163,14 @@ async def list_tasks(
     ),
     priority: str | None = Query(None, description="Filter by priority"),
     type: str | None = Query(None, description="Filter by work item type"),
-    search: str | None = Query(
-        None, description="Search title, key, or description"
-    ),
-    due_date_from: datetime | None = Query(
-        None, description="Due date starting range"
-    ),
-    due_date_to: datetime | None = Query(
-        None, description="Due date ending range"
-    ),
+    search: str | None = Query(None, description="Search title, key, or description"),
+    due_date_from: datetime | None = Query(None, description="Due date starting range"),
+    due_date_to: datetime | None = Query(None, description="Due date ending range"),
     is_overdue: bool | None = Query(
         None, description="Filter overdue incomplete tasks"
     ),
-    due_soon: bool | None = Query(
-        None, description="Filter tasks due in next 7 days"
-    ),
-    is_completed: bool | None = Query(
-        None, description="Filter completed tasks"
-    ),
+    due_soon: bool | None = Query(None, description="Filter tasks due in next 7 days"),
+    is_completed: bool | None = Query(None, description="Filter completed tasks"),
     label_id: uuid.UUID | None = Query(
         None, description="Filter by taxonomic label ID"
     ),
@@ -1171,4 +1163,46 @@ async def list_subtasks(
         project_id=project_id,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.post(
+    "/tasks/bulk-operation",
+    response_model=BulkTaskOperationResponse,
+    summary="Execute batch operation on tasks",
+)
+async def bulk_task_operation(
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+    request: BulkTaskOperationRequest,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    org_service: Annotated[OrganizationService, Depends(get_organization_service)],
+    project_service: Annotated[ProjectService, Depends(get_project_service)],
+    task_service: Annotated[TaskService, Depends(get_task_service)],
+) -> BulkTaskOperationResponse:
+    """Execute status, assignment, priority, label, or delete operations in bulk."""
+    org_membership = await get_org_membership(
+        organization_id, current_user.id, org_service
+    )
+    project = await project_service.get_project_by_id(
+        project_id, org_id=organization_id
+    )
+    proj_membership = await verify_project_access(
+        project, current_user.id, org_membership, project_service
+    )
+
+    if request.operation == "delete" and not can_manage_project(
+        project, current_user.id, org_membership, proj_membership
+    ):
+        raise DomainException(
+            code="INSUFFICIENT_PERMISSIONS",
+            message="Only project administrators can perform bulk deletions.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    return await task_service.execute_bulk_operation(
+        project_id=project_id,
+        org_id=organization_id,
+        actor_id=current_user.id,
+        request=request,
     )

@@ -11,10 +11,15 @@ from taskflow.domains.organizations.models import OrganizationMembership
 from taskflow.domains.projects.models import Project, ProjectMembership, ProjectSequence
 from taskflow.domains.work_items.models import (
     Attachment,
+    AutomationLog,
+    AutomationRule,
     ChecklistItem,
+    Label,
     Milestone,
+    RecurringTaskRule,
     SavedFilter,
     TaskDependency,
+    TaskTemplate,
     WorkflowStatus,
     WorkflowTransition,
     WorkItem,
@@ -823,7 +828,10 @@ class WorkItemRepository:
         return list(res.scalars().all())
 
     async def delete_work_item(self, item: WorkItem) -> None:
-        """Delete a work item."""
+        """Delete a work item and its associated dependencies."""
+        pred_deps, succ_deps = await self.list_dependencies_for_task(item.id)
+        for dep in pred_deps + succ_deps:
+            await self.session.delete(dep)
         await self.session.delete(item)
         await self.session.flush()
 
@@ -856,15 +864,19 @@ class WorkItemRepository:
         # Try UUID first
         try:
             status_uuid = uuid.UUID(identifier)
-            stmt = select(WorkflowStatus).where(
-                WorkflowStatus.id == status_uuid,
-                or_(
-                    WorkflowStatus.project_id == project_id,
-                    WorkflowStatus.project_id.is_(None),
-                ),
+            stmt = (
+                select(WorkflowStatus)
+                .where(
+                    WorkflowStatus.id == status_uuid,
+                    or_(
+                        WorkflowStatus.project_id == project_id,
+                        WorkflowStatus.project_id.is_(None),
+                    ),
+                )
+                .order_by(case((WorkflowStatus.project_id == project_id, 0), else_=1))
             )
             res = await self.session.execute(stmt)
-            found = res.scalar_one_or_none()
+            found = res.scalars().first()
             if found:
                 return found
         except ValueError:
@@ -872,19 +884,31 @@ class WorkItemRepository:
 
         # Match name or category or normalized name
         norm = identifier.strip().lower()
-        stmt = select(WorkflowStatus).where(
-            or_(
-                func.lower(WorkflowStatus.name) == norm,
-                func.lower(WorkflowStatus.name) == norm.replace("_", " "),
-                func.lower(WorkflowStatus.category) == norm,
-            ),
-            or_(
-                WorkflowStatus.project_id == project_id,
-                WorkflowStatus.project_id.is_(None),
-            ),
+        stmt = (
+            select(WorkflowStatus)
+            .where(
+                or_(
+                    func.lower(WorkflowStatus.name) == norm,
+                    func.lower(WorkflowStatus.name) == norm.replace("_", " "),
+                    func.lower(WorkflowStatus.category) == norm,
+                ),
+                or_(
+                    WorkflowStatus.project_id == project_id,
+                    WorkflowStatus.project_id.is_(None),
+                ),
+            )
+            .order_by(
+                case((WorkflowStatus.project_id == project_id, 0), else_=1),
+                case(
+                    (func.lower(WorkflowStatus.name) == norm, 0),
+                    (func.lower(WorkflowStatus.name) == norm.replace("_", " "), 1),
+                    else_=2,
+                ),
+                WorkflowStatus.position.asc(),
+            )
         )
         res = await self.session.execute(stmt)
-        return res.scalar_one_or_none()
+        return res.scalars().first()
 
     async def get_allowed_transitions(
         self, from_status_id: uuid.UUID
@@ -939,8 +963,145 @@ class WorkItemRepository:
             self.session.add(status_obj)
             created.append(status_obj)
 
-        await self.session.flush()
+        await self.session.commit()
+        for s in created:
+            await self.session.refresh(s)
         return created
+
+    async def create_workflow_status(
+        self,
+        project_id: uuid.UUID,
+        name: str,
+        category: str = "todo",
+        position: int = 0,
+        is_default: bool = False,
+    ) -> WorkflowStatus:
+        """Create a custom workflow status for a project."""
+        if is_default:
+            # Clear previous default status if setting this one as default
+            existing_statuses = await self.get_project_statuses(project_id)
+            for st in existing_statuses:
+                if st.is_default and st.project_id == project_id:
+                    st.is_default = False
+
+        status_obj = WorkflowStatus(
+            project_id=project_id,
+            name=name,
+            category=category,
+            position=position,
+            is_default=is_default,
+        )
+        self.session.add(status_obj)
+        await self.session.flush()
+        return status_obj
+
+    async def get_workflow_status_by_id(
+        self, status_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> WorkflowStatus | None:
+        """Fetch a specific workflow status by ID and optional project scope."""
+        stmt = select(WorkflowStatus).where(WorkflowStatus.id == status_id)
+        if project_id is not None:
+            stmt = stmt.where(
+                or_(
+                    WorkflowStatus.project_id == project_id,
+                    WorkflowStatus.project_id.is_(None),
+                )
+            )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def update_workflow_status(
+        self, status_obj: WorkflowStatus, **kwargs: Any
+    ) -> WorkflowStatus:
+        """Update fields of an existing workflow status."""
+        if kwargs.get("is_default") and status_obj.project_id:
+            existing = await self.get_project_statuses(status_obj.project_id)
+            for st in existing:
+                if st.id != status_obj.id and st.project_id == status_obj.project_id:
+                    st.is_default = False
+
+        for k, v in kwargs.items():
+            if v is not None and hasattr(status_obj, k):
+                setattr(status_obj, k, v)
+        await self.session.flush()
+        return status_obj
+
+    async def delete_workflow_status(self, status_obj: WorkflowStatus) -> None:
+        """Delete a custom workflow status."""
+        await self.session.delete(status_obj)
+        await self.session.flush()
+
+    async def count_tasks_in_status(
+        self, project_id: uuid.UUID, status_name: str
+    ) -> int:
+        """Count non-archived tasks in a given status for a project."""
+        stmt = select(func.count(WorkItem.id)).where(
+            WorkItem.project_id == project_id,
+            func.lower(WorkItem.status) == status_name.strip().lower(),
+        )
+        res = await self.session.execute(stmt)
+        return int(res.scalar_one() or 0)
+
+    async def create_workflow_transition(
+        self,
+        from_status_id: uuid.UUID,
+        to_status_id: uuid.UUID,
+        name: str | None = None,
+    ) -> WorkflowTransition:
+        """Create a permitted transition rule between statuses."""
+        trans = WorkflowTransition(
+            from_status_id=from_status_id,
+            to_status_id=to_status_id,
+            name=name,
+        )
+        self.session.add(trans)
+        await self.session.flush()
+        return trans
+
+    async def get_workflow_transition_by_id(
+        self, transition_id: uuid.UUID
+    ) -> WorkflowTransition | None:
+        """Get a specific workflow transition rule by ID."""
+        stmt = select(WorkflowTransition).where(WorkflowTransition.id == transition_id)
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def get_transition_by_from_to(
+        self, from_status_id: uuid.UUID, to_status_id: uuid.UUID
+    ) -> WorkflowTransition | None:
+        """Fetch transition matching specific source and destination status IDs."""
+        stmt = select(WorkflowTransition).where(
+            WorkflowTransition.from_status_id == from_status_id,
+            WorkflowTransition.to_status_id == to_status_id,
+        )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def list_transitions_for_project(
+        self, project_id: uuid.UUID
+    ) -> list[WorkflowTransition]:
+        """Fetch all transitions connected to a project's statuses."""
+        statuses = await self.get_project_statuses(project_id)
+        status_ids = [s.id for s in statuses]
+        if not status_ids:
+            return []
+        stmt = (
+            select(WorkflowTransition)
+            .where(
+                or_(
+                    WorkflowTransition.from_status_id.in_(status_ids),
+                    WorkflowTransition.to_status_id.in_(status_ids),
+                )
+            )
+            .order_by(WorkflowTransition.created_at.asc())
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def delete_workflow_transition(self, transition: WorkflowTransition) -> None:
+        """Delete an allowed transition rule."""
+        await self.session.delete(transition)
+        await self.session.flush()
 
     # ---------------- Task History & Activity Logging ---------------- #
 
@@ -1499,9 +1660,9 @@ class WorkItemRepository:
             select(
                 WorkItem.milestone_id,
                 func.count(WorkItem.id).label("total"),
-                func.count(
-                    case((WorkItem.status.in_(COMPLETED_STATUSES), 1))
-                ).label("completed"),
+                func.count(case((WorkItem.status.in_(COMPLETED_STATUSES), 1))).label(
+                    "completed"
+                ),
             )
             .where(
                 WorkItem.project_id == project_id,
@@ -1602,9 +1763,9 @@ class WorkItemRepository:
         if predecessor_id == successor_id:
             return True
 
-        stmt = select(
-            TaskDependency.predecessor_id, TaskDependency.successor_id
-        ).where(TaskDependency.project_id == project_id)
+        stmt = select(TaskDependency.predecessor_id, TaskDependency.successor_id).where(
+            TaskDependency.project_id == project_id
+        )
         res = await self.session.execute(stmt)
         edges = res.all()
 
@@ -1629,6 +1790,319 @@ class WorkItemRepository:
     async def delete_dependency(self, dependency: TaskDependency) -> None:
         await self.session.delete(dependency)
         await self.session.flush()
+
+    async def get_incomplete_predecessors(self, task_id: uuid.UUID) -> list[WorkItem]:
+        """Fetch incomplete predecessor tasks that block completion of task_id."""
+        stmt = (
+            select(WorkItem)
+            .join(
+                TaskDependency,
+                TaskDependency.predecessor_id == WorkItem.id,
+            )
+            .where(
+                TaskDependency.successor_id == task_id,
+                ~func.lower(WorkItem.status).in_(COMPLETED_STATUSES),
+                WorkItem.completed_at.is_(None),
+            )
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    # ---------------- Task Templates ---------------- #
+
+    async def create_template(
+        self,
+        project_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        name: str,
+        task_title: str,
+        description: str | None = None,
+        task_description: str | None = None,
+        task_type: str = "task",
+        priority: str = "medium",
+        estimated_points: int | None = None,
+        checklist_definitions: list[dict] | None = None,
+        default_assignee_id: uuid.UUID | None = None,
+        created_by_id: uuid.UUID | None = None,
+    ) -> TaskTemplate:
+        template = TaskTemplate(
+            project_id=project_id,
+            organization_id=organization_id,
+            name=name,
+            description=description,
+            task_title=task_title,
+            task_description=task_description,
+            task_type=task_type,
+            priority=priority,
+            estimated_points=estimated_points,
+            checklist_definitions=checklist_definitions,
+            default_assignee_id=default_assignee_id,
+            created_by_id=created_by_id,
+        )
+        self.session.add(template)
+        await self.session.flush()
+        return template
+
+    async def get_template(
+        self, template_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> TaskTemplate | None:
+        stmt = select(TaskTemplate).where(TaskTemplate.id == template_id)
+        if project_id is not None:
+            stmt = stmt.where(TaskTemplate.project_id == project_id)
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def get_template_by_name(
+        self, project_id: uuid.UUID, name: str
+    ) -> TaskTemplate | None:
+        stmt = select(TaskTemplate).where(
+            TaskTemplate.project_id == project_id,
+            func.lower(TaskTemplate.name) == name.strip().lower(),
+        )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def list_templates(self, project_id: uuid.UUID) -> list[TaskTemplate]:
+        stmt = (
+            select(TaskTemplate)
+            .where(TaskTemplate.project_id == project_id)
+            .order_by(TaskTemplate.name.asc())
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def update_template(
+        self, template: TaskTemplate, **kwargs: Any
+    ) -> TaskTemplate:
+        for k, v in kwargs.items():
+            if v is not None and hasattr(template, k):
+                setattr(template, k, v)
+        await self.session.flush()
+        return template
+
+    async def delete_template(self, template: TaskTemplate) -> None:
+        await self.session.delete(template)
+        await self.session.flush()
+
+    # ---------------- Recurring Tasks ---------------- #
+
+    async def create_recurring_rule(
+        self,
+        project_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        title: str,
+        recurrence_pattern: str,
+        interval_value: int = 1,
+        timezone: str = "UTC",
+        next_run_at: datetime | None = None,
+        description: str | None = None,
+        type: str = "task",
+        priority: str = "medium",
+        estimated_points: int | None = None,
+        assignee_id: uuid.UUID | None = None,
+        is_active: bool = True,
+        created_by_id: uuid.UUID | None = None,
+    ) -> RecurringTaskRule:
+        rule = RecurringTaskRule(
+            project_id=project_id,
+            organization_id=organization_id,
+            title=title,
+            description=description,
+            type=type,
+            priority=priority,
+            estimated_points=estimated_points,
+            assignee_id=assignee_id,
+            recurrence_pattern=recurrence_pattern,
+            interval_value=interval_value,
+            timezone=timezone,
+            next_run_at=next_run_at or datetime.now(UTC),
+            is_active=is_active,
+            created_by_id=created_by_id,
+        )
+        self.session.add(rule)
+        await self.session.flush()
+        return rule
+
+    async def get_recurring_rule(
+        self, rule_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> RecurringTaskRule | None:
+        stmt = select(RecurringTaskRule).where(RecurringTaskRule.id == rule_id)
+        if project_id is not None:
+            stmt = stmt.where(RecurringTaskRule.project_id == project_id)
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def list_recurring_rules(
+        self, project_id: uuid.UUID, active_only: bool = False
+    ) -> list[RecurringTaskRule]:
+        stmt = select(RecurringTaskRule).where(
+            RecurringTaskRule.project_id == project_id
+        )
+        if active_only:
+            stmt = stmt.where(RecurringTaskRule.is_active == True)  # noqa: E712
+        stmt = stmt.order_by(RecurringTaskRule.created_at.desc())
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def get_due_recurring_rules(
+        self, current_time: datetime
+    ) -> list[RecurringTaskRule]:
+        stmt = (
+            select(RecurringTaskRule)
+            .where(
+                RecurringTaskRule.is_active == True,  # noqa: E712
+                RecurringTaskRule.next_run_at <= current_time,
+            )
+            .order_by(RecurringTaskRule.next_run_at.asc())
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def update_recurring_rule(
+        self, rule: RecurringTaskRule, **kwargs: Any
+    ) -> RecurringTaskRule:
+        for k, v in kwargs.items():
+            if v is not None and hasattr(rule, k):
+                setattr(rule, k, v)
+        await self.session.flush()
+        return rule
+
+    async def delete_recurring_rule(self, rule: RecurringTaskRule) -> None:
+        await self.session.delete(rule)
+        await self.session.flush()
+
+    # ---------------- Automation Rules & Logs ---------------- #
+
+    async def create_automation_rule(
+        self,
+        project_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        name: str,
+        trigger_event: str,
+        action_type: str,
+        action_payload: dict,
+        trigger_conditions: dict | None = None,
+        description: str | None = None,
+        is_active: bool = True,
+        created_by_id: uuid.UUID | None = None,
+    ) -> AutomationRule:
+        rule = AutomationRule(
+            project_id=project_id,
+            organization_id=organization_id,
+            name=name,
+            description=description,
+            trigger_event=trigger_event,
+            trigger_conditions=trigger_conditions,
+            action_type=action_type,
+            action_payload=action_payload,
+            is_active=is_active,
+            created_by_id=created_by_id,
+        )
+        self.session.add(rule)
+        await self.session.flush()
+        return rule
+
+    async def get_automation_rule(
+        self, rule_id: uuid.UUID, project_id: uuid.UUID | None = None
+    ) -> AutomationRule | None:
+        stmt = select(AutomationRule).where(AutomationRule.id == rule_id)
+        if project_id is not None:
+            stmt = stmt.where(AutomationRule.project_id == project_id)
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def list_automation_rules(
+        self,
+        project_id: uuid.UUID,
+        trigger_event: str | None = None,
+        active_only: bool = False,
+    ) -> list[AutomationRule]:
+        stmt = select(AutomationRule).where(AutomationRule.project_id == project_id)
+        if trigger_event is not None:
+            stmt = stmt.where(AutomationRule.trigger_event == trigger_event)
+        if active_only:
+            stmt = stmt.where(AutomationRule.is_active == True)  # noqa: E712
+        stmt = stmt.order_by(AutomationRule.created_at.desc())
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def update_automation_rule(
+        self, rule: AutomationRule, **kwargs: Any
+    ) -> AutomationRule:
+        for k, v in kwargs.items():
+            if v is not None and hasattr(rule, k):
+                setattr(rule, k, v)
+        await self.session.flush()
+        return rule
+
+    async def delete_automation_rule(self, rule: AutomationRule) -> None:
+        await self.session.delete(rule)
+        await self.session.flush()
+
+    async def create_automation_log(
+        self,
+        rule_id: uuid.UUID,
+        project_id: uuid.UUID,
+        trigger_event: str,
+        status: str,
+        action_taken: str,
+        work_item_id: uuid.UUID | None = None,
+        error_message: str | None = None,
+        details: dict | None = None,
+    ) -> AutomationLog:
+        log_entry = AutomationLog(
+            rule_id=rule_id,
+            project_id=project_id,
+            work_item_id=work_item_id,
+            trigger_event=trigger_event,
+            status=status,
+            action_taken=action_taken,
+            error_message=error_message,
+            details=details,
+        )
+        self.session.add(log_entry)
+        await self.session.flush()
+        return log_entry
+
+    async def list_automation_logs(
+        self,
+        project_id: uuid.UUID,
+        rule_id: uuid.UUID | None = None,
+        limit: int = 50,
+    ) -> list[AutomationLog]:
+        stmt = select(AutomationLog).where(AutomationLog.project_id == project_id)
+        if rule_id is not None:
+            stmt = stmt.where(AutomationLog.rule_id == rule_id)
+        stmt = stmt.order_by(AutomationLog.executed_at.desc()).limit(limit)
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def get_label_by_id(
+        self, label_id: uuid.UUID, org_id: uuid.UUID
+    ) -> Label | None:
+        """Fetch a label by ID scoped to organization."""
+        stmt = select(Label).where(
+            Label.id == label_id,
+            Label.organization_id == org_id,
+        )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def add_label_to_item(
+        self, work_item_id: uuid.UUID, label_id: uuid.UUID
+    ) -> None:
+        """Attach a label to a work item if not already attached."""
+        check_stmt = select(work_item_labels.c.work_item_id).where(
+            work_item_labels.c.work_item_id == work_item_id,
+            work_item_labels.c.label_id == label_id,
+        )
+        res = await self.session.execute(check_stmt)
+        if res.scalar_one_or_none() is None:
+            insert_stmt = work_item_labels.insert().values(
+                work_item_id=work_item_id, label_id=label_id
+            )
+            await self.session.execute(insert_stmt)
+            await self.session.flush()
 
 
 class SavedFilterRepository:
@@ -1684,4 +2158,3 @@ class SavedFilterRepository:
     async def delete(self, saved_filter: SavedFilter) -> None:
         await self.session.delete(saved_filter)
         await self.session.flush()
-
