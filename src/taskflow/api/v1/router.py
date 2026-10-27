@@ -2,6 +2,9 @@ from fastapi import APIRouter
 
 from taskflow.api.v1.endpoints.admin import router as admin_router
 from taskflow.api.v1.endpoints.auth import router as auth_router
+from taskflow.api.v1.endpoints.calendar_timeline import (
+    router as calendar_timeline_router,
+)
 from taskflow.api.v1.endpoints.dashboard import router as dashboard_router
 from taskflow.api.v1.endpoints.health import HealthResponse
 from taskflow.api.v1.endpoints.my_tasks import router as my_tasks_router
@@ -30,6 +33,7 @@ router.include_router(organizations_router)
 router.include_router(projects_router)
 router.include_router(tasks_router)
 router.include_router(scrum_router)
+router.include_router(calendar_timeline_router)
 router.include_router(notifications_router)
 router.include_router(search_router)
 router.include_router(saved_filters_router)

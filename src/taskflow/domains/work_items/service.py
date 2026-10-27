@@ -17,7 +17,11 @@ from taskflow.domains.collaboration.websocket import (
 from taskflow.domains.identity.repository import UserRepository
 from taskflow.domains.organizations.repository import OrganizationRepository
 from taskflow.domains.projects.repository import ProjectRepository
-from taskflow.domains.work_items.models import Attachment, SavedFilter, WorkItem
+from taskflow.domains.work_items.models import (
+    Attachment,
+    SavedFilter,
+    WorkItem,
+)
 from taskflow.domains.work_items.repository import (
     COMPLETED_STATUSES,
     DashboardRepository,
@@ -27,6 +31,8 @@ from taskflow.domains.work_items.repository import (
 from taskflow.domains.work_items.schemas import (
     AttachmentListResponse,
     AttachmentResponse,
+    CalendarResponse,
+    CalendarTaskItem,
     ChecklistItemCreateRequest,
     ChecklistItemResponse,
     ChecklistItemUpdateRequest,
@@ -35,6 +41,11 @@ from taskflow.domains.work_items.schemas import (
     GlobalSearchResponse,
     KanbanBoardResponse,
     KanbanColumn,
+    MilestoneBrief,
+    MilestoneCreateRequest,
+    MilestoneListResponse,
+    MilestoneResponse,
+    MilestoneUpdateRequest,
     OverdueUpcomingTasksResponse,
     ProjectBrief,
     ProjectSummary,
@@ -43,8 +54,16 @@ from taskflow.domains.work_items.schemas import (
     SearchProjectResult,
     SearchTaskResult,
     SubtaskCreateRequest,
+    TaskDependenciesSummary,
+    TaskDependencyCreateRequest,
+    TaskDependencyListResponse,
+    TaskDependencyResponse,
     TaskFilterCriteria,
     TaskStatusMoveRequest,
+    TimelineDependencyItem,
+    TimelineMilestoneItem,
+    TimelineResponse,
+    TimelineTaskItem,
     UserActivityActor,
     UserActivityItem,
     UserActivityListResponse,
@@ -59,6 +78,15 @@ from taskflow.domains.work_items.schemas import (
     WorkItemUpdateRequest,
 )
 from taskflow.domains.work_items.storage import default_storage
+
+
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    """Ensure a datetime is timezone-aware and normalized to UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 class DashboardService:
@@ -628,6 +656,19 @@ class TaskService:
                     details={"parent_id": str(request.parent_id)},
                 )
 
+        # Validate milestone if provided
+        if request.milestone_id is not None:
+            milestone = await self.work_item_repo.get_milestone_by_id(
+                request.milestone_id, project_id=project_id
+            )
+            if milestone is None:
+                raise DomainException(
+                    code="MILESTONE_NOT_FOUND",
+                    message="Milestone not found in this project.",
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    details={"milestone_id": str(request.milestone_id)},
+                )
+
         # Atomically increment issue sequence counter
         seq_num, issue_key = await self.work_item_repo.get_next_sequence_and_issue_key(
             project_id=project.id,
@@ -651,6 +692,8 @@ class TaskService:
             parent_id=request.parent_id,
             sprint_id=request.sprint_id,
             due_date=request.due_date,
+            start_date=request.start_date,
+            milestone_id=request.milestone_id,
             estimated_points=request.estimated_points,
             rank=rank_val,
         )
@@ -858,14 +901,52 @@ class TaskService:
             task.parent_id = request.parent_id
             mutated = True
 
+        # Validate date consistency if either start_date or due_date is updated
+        new_start = (
+            request.start_date
+            if "start_date" in request.model_fields_set
+            else task.start_date
+        )
+        new_due = (
+            request.due_date
+            if "due_date" in request.model_fields_set
+            else task.due_date
+        )
+        norm_start = _ensure_utc(new_start)
+        norm_due = _ensure_utc(new_due)
+        if norm_start is not None and norm_due is not None and norm_due < norm_start:
+            raise DomainException(
+                code="INVALID_DATES",
+                message="due_date cannot be earlier than start_date.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={
+                    "start_date": norm_start.isoformat(),
+                    "due_date": norm_due.isoformat(),
+                },
+            )
+
+        if (
+            "start_date" in request.model_fields_set
+            and request.start_date != task.start_date
+        ):
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "start_date",
+                task.start_date.isoformat() if task.start_date else None,
+                request.start_date.isoformat() if request.start_date else None,
+            )
+            task.start_date = request.start_date
+            mutated = True
+
         due_date_notif = None
-        if request.due_date is not None and request.due_date != task.due_date:
+        if "due_date" in request.model_fields_set and request.due_date != task.due_date:
             await self.work_item_repo.record_activity(
                 task.id,
                 actor_id,
                 "due_date",
                 task.due_date.isoformat() if task.due_date else None,
-                request.due_date.isoformat(),
+                request.due_date.isoformat() if request.due_date else None,
             )
             task.due_date = request.due_date
             mutated = True
@@ -878,6 +959,7 @@ class TaskService:
                 task.assignee_id
                 and task.assignee_id != actor_id
                 and not is_already_notified
+                and request.due_date is not None
             ):
                 due_str = request.due_date.strftime("%Y-%m-%d")
                 due_date_notif = await self.collab_repo.create_notification(
@@ -892,6 +974,31 @@ class TaskService:
                     resource_type="task",
                     resource_id=task.id,
                 )
+
+        if (
+            "milestone_id" in request.model_fields_set
+            and request.milestone_id != task.milestone_id
+        ):
+            if request.milestone_id is not None:
+                milestone = await self.work_item_repo.get_milestone_by_id(
+                    request.milestone_id, project_id=task.project_id
+                )
+                if milestone is None:
+                    raise DomainException(
+                        code="MILESTONE_NOT_FOUND",
+                        message="Milestone not found in this project.",
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        details={"milestone_id": str(request.milestone_id)},
+                    )
+            await self.work_item_repo.record_activity(
+                task.id,
+                actor_id,
+                "milestone_id",
+                str(task.milestone_id) if task.milestone_id else None,
+                str(request.milestone_id) if request.milestone_id else None,
+            )
+            task.milestone_id = request.milestone_id
+            mutated = True
 
 
         if (
@@ -1378,6 +1485,22 @@ class TaskService:
 
         comments_count = len(task.comments) if task.comments else 0
 
+        milestone_dto = (
+            MilestoneBrief.model_validate(task.milestone)
+            if task.milestone
+            else None
+        )
+        dependencies_dto = TaskDependenciesSummary(
+            predecessors=[
+                TaskDependencyResponse.model_validate(dep)
+                for dep in (task.predecessor_dependencies or [])
+            ],
+            successors=[
+                TaskDependencyResponse.model_validate(dep)
+                for dep in (task.successor_dependencies or [])
+            ],
+        )
+
         return WorkItemDetailResponse(
             id=task.id,
             project_id=task.project_id,
@@ -1394,7 +1517,9 @@ class TaskService:
             assignee_id=task.assignee_id,
             sprint_id=task.sprint_id,
             rank=task.rank,
+            start_date=task.start_date,
             due_date=task.due_date,
+            milestone_id=task.milestone_id,
             estimated_points=task.estimated_points,
             version=task.version,
             created_at=task.created_at,
@@ -1402,6 +1527,8 @@ class TaskService:
             project=project_brief,
             reporter=reporter_dto,
             assignee=assignee_dto,
+            milestone=milestone_dto,
+            dependencies=dependencies_dto,
             subtasks=subtasks_dtos,
             checklists=checklists_dtos,
             attachments=attachments_dtos,
@@ -1882,6 +2009,600 @@ class TaskService:
             page=page,
             page_size=page_size,
             total=total,
+        )
+
+    # -------------------------------------------------------------
+    # Phase 8: Milestones
+    # -------------------------------------------------------------
+
+    async def create_milestone(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        request: MilestoneCreateRequest,
+    ) -> MilestoneResponse:
+        """Create a new project milestone."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        existing = await self.work_item_repo.get_milestone_by_name(
+            project_id, request.name
+        )
+        if existing is not None:
+            raise DomainException(
+                code="DUPLICATE_MILESTONE",
+                message=f"Milestone '{request.name}' already exists in this project.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+
+        milestone = await self.work_item_repo.create_milestone(
+            project_id=project_id,
+            name=request.name.strip(),
+            description=request.description.strip() if request.description else None,
+            target_date=request.target_date,
+            is_completed=request.is_completed,
+        )
+        await self.session.commit()
+        await self.session.refresh(milestone)
+
+        return MilestoneResponse(
+            id=milestone.id,
+            project_id=milestone.project_id,
+            name=milestone.name,
+            description=milestone.description,
+            target_date=milestone.target_date,
+            is_completed=milestone.is_completed,
+            total_tasks=0,
+            completed_tasks=0,
+            created_at=milestone.created_at,
+            updated_at=milestone.updated_at,
+        )
+
+    async def get_milestone(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        milestone_id: uuid.UUID,
+    ) -> MilestoneResponse:
+        """Fetch milestone details with task statistics."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        milestone = await self.work_item_repo.get_milestone_by_id(
+            milestone_id, project_id=project_id
+        )
+        if milestone is None:
+            raise DomainException(
+                code="MILESTONE_NOT_FOUND",
+                message="Milestone not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        counts = await self.work_item_repo.get_milestone_task_counts(project_id)
+        total, completed = counts.get(milestone.id, (0, 0))
+
+        return MilestoneResponse(
+            id=milestone.id,
+            project_id=milestone.project_id,
+            name=milestone.name,
+            description=milestone.description,
+            target_date=milestone.target_date,
+            is_completed=milestone.is_completed,
+            total_tasks=total,
+            completed_tasks=completed,
+            created_at=milestone.created_at,
+            updated_at=milestone.updated_at,
+        )
+
+    async def list_milestones(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        is_completed: bool | None = None,
+    ) -> MilestoneListResponse:
+        """List all milestones in project with completion statistics."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        milestones = await self.work_item_repo.list_milestones(
+            project_id, is_completed=is_completed
+        )
+        counts = await self.work_item_repo.get_milestone_task_counts(project_id)
+
+        items = [
+            MilestoneResponse(
+                id=m.id,
+                project_id=m.project_id,
+                name=m.name,
+                description=m.description,
+                target_date=m.target_date,
+                is_completed=m.is_completed,
+                total_tasks=counts.get(m.id, (0, 0))[0],
+                completed_tasks=counts.get(m.id, (0, 0))[1],
+                created_at=m.created_at,
+                updated_at=m.updated_at,
+            )
+            for m in milestones
+        ]
+
+        return MilestoneListResponse(items=items, total=len(items))
+
+    async def update_milestone(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        milestone_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        request: MilestoneUpdateRequest,
+    ) -> MilestoneResponse:
+        """Update milestone properties."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        milestone = await self.work_item_repo.get_milestone_by_id(
+            milestone_id, project_id=project_id
+        )
+        if milestone is None:
+            raise DomainException(
+                code="MILESTONE_NOT_FOUND",
+                message="Milestone not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        if request.name is not None and request.name.strip() != milestone.name:
+            existing = await self.work_item_repo.get_milestone_by_name(
+                project_id, request.name
+            )
+            if existing is not None and existing.id != milestone.id:
+                raise DomainException(
+                    code="DUPLICATE_MILESTONE",
+                    message=(
+                        f"Milestone '{request.name}' already exists in this project."
+                    ),
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            milestone.name = request.name.strip()
+
+        if request.description is not None:
+            milestone.description = (
+                request.description.strip() if request.description else None
+            )
+
+        if request.target_date is not None:
+            milestone.target_date = request.target_date
+
+        if request.is_completed is not None:
+            milestone.is_completed = request.is_completed
+
+        milestone.updated_at = datetime.now(UTC)
+        await self.session.commit()
+        await self.session.refresh(milestone)
+
+        counts = await self.work_item_repo.get_milestone_task_counts(project_id)
+        total, completed = counts.get(milestone.id, (0, 0))
+
+        return MilestoneResponse(
+            id=milestone.id,
+            project_id=milestone.project_id,
+            name=milestone.name,
+            description=milestone.description,
+            target_date=milestone.target_date,
+            is_completed=milestone.is_completed,
+            total_tasks=total,
+            completed_tasks=completed,
+            created_at=milestone.created_at,
+            updated_at=milestone.updated_at,
+        )
+
+    async def delete_milestone(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        milestone_id: uuid.UUID,
+        actor_id: uuid.UUID,
+    ) -> None:
+        """Delete milestone and clear references from associated work items."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        milestone = await self.work_item_repo.get_milestone_by_id(
+            milestone_id, project_id=project_id
+        )
+        if milestone is None:
+            raise DomainException(
+                code="MILESTONE_NOT_FOUND",
+                message="Milestone not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        await self.work_item_repo.delete_milestone(milestone)
+        await self.session.commit()
+
+    # -------------------------------------------------------------
+    # Phase 8: Task Dependencies
+    # -------------------------------------------------------------
+
+    async def create_dependency(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        request: TaskDependencyCreateRequest,
+    ) -> TaskDependencyResponse:
+        """Create task dependency with strict cross-project and DAG cycle validation."""
+        if request.predecessor_id == request.successor_id:
+            raise DomainException(
+                code="SELF_DEPENDENCY",
+                message="A task cannot depend on itself.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        pred_task = await self.work_item_repo.get_by_id(request.predecessor_id)
+        if (
+            pred_task is None
+            or pred_task.project_id != project_id
+            or pred_task.organization_id != org_id
+        ):
+            raise DomainException(
+                code="PREDECESSOR_TASK_NOT_FOUND",
+                message="Predecessor task not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"predecessor_id": str(request.predecessor_id)},
+            )
+
+        succ_task = await self.work_item_repo.get_by_id(request.successor_id)
+        if (
+            succ_task is None
+            or succ_task.project_id != project_id
+            or succ_task.organization_id != org_id
+        ):
+            raise DomainException(
+                code="SUCCESSOR_TASK_NOT_FOUND",
+                message="Successor task not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"successor_id": str(request.successor_id)},
+            )
+
+        # Check for duplicate dependency
+        existing_dep = await self.work_item_repo.get_dependency_by_nodes(
+            request.predecessor_id, request.successor_id
+        )
+        if existing_dep is not None:
+            raise DomainException(
+                code="DUPLICATE_DEPENDENCY",
+                message="This dependency relationship already exists.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+
+        # Check for circular dependency
+        is_circular = await self.work_item_repo.check_circular_dependency(
+            project_id=project_id,
+            predecessor_id=request.predecessor_id,
+            successor_id=request.successor_id,
+        )
+        if is_circular:
+            raise DomainException(
+                code="CIRCULAR_DEPENDENCY",
+                message=(
+                    f"Adding dependency from {pred_task.issue_key} to "
+                    f"{succ_task.issue_key} would create a circular dependency cycle."
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={
+                    "predecessor_id": str(request.predecessor_id),
+                    "successor_id": str(request.successor_id),
+                },
+            )
+
+        dep = await self.work_item_repo.create_dependency(
+            project_id=project_id,
+            predecessor_id=request.predecessor_id,
+            successor_id=request.successor_id,
+            dependency_type=request.dependency_type,
+        )
+
+        await self.work_item_repo.record_activity(
+            work_item_id=request.successor_id,
+            user_id=actor_id,
+            field="dependency_added",
+            old_value=None,
+            new_value=f"Depends on {pred_task.issue_key}",
+        )
+        await self.session.commit()
+        await self.session.refresh(dep)
+
+        return TaskDependencyResponse.model_validate(dep)
+
+    async def list_dependencies_for_project(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+    ) -> TaskDependencyListResponse:
+        """List all task dependencies in a project."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        deps = await self.work_item_repo.list_dependencies_for_project(project_id)
+        dtos = [TaskDependencyResponse.model_validate(d) for d in deps]
+        return TaskDependencyListResponse(items=dtos, total=len(dtos))
+
+    async def list_dependencies_for_task(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        task_id: uuid.UUID,
+    ) -> TaskDependenciesSummary:
+        """List direct incoming and outgoing dependencies for a specific task."""
+        task = await self.get_task_by_id(task_id, project_id=project_id)
+        preds, succs = await self.work_item_repo.list_dependencies_for_task(task.id)
+        return TaskDependenciesSummary(
+            predecessors=[TaskDependencyResponse.model_validate(d) for d in preds],
+            successors=[TaskDependencyResponse.model_validate(d) for d in succs],
+        )
+
+    async def delete_dependency(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        dependency_id: uuid.UUID,
+        actor_id: uuid.UUID,
+    ) -> None:
+        """Remove a task dependency relationship."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        dep = await self.work_item_repo.get_dependency_by_id(
+            dependency_id, project_id=project_id
+        )
+        if dep is None:
+            raise DomainException(
+                code="DEPENDENCY_NOT_FOUND",
+                message="Task dependency not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        pred_id = dep.predecessor_id
+        succ_id = dep.successor_id
+
+        await self.work_item_repo.delete_dependency(dep)
+        await self.work_item_repo.record_activity(
+            work_item_id=succ_id,
+            user_id=actor_id,
+            field="dependency_removed",
+            old_value=str(pred_id),
+            new_value=None,
+        )
+        await self.session.commit()
+
+    # -------------------------------------------------------------
+    # Phase 8: Calendar & Timeline Views
+    # -------------------------------------------------------------
+
+    async def get_calendar_view(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        start_date: datetime,
+        end_date: datetime,
+        assignee_id: uuid.UUID | None = None,
+        task_status: str | None = None,
+        include_unscheduled: bool = False,
+    ) -> CalendarResponse:
+        """Retrieve authorized project tasks spanning calendar date window."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        norm_start = _ensure_utc(start_date)
+        norm_end = _ensure_utc(end_date)
+        if norm_start is None or norm_end is None or norm_end < norm_start:
+            raise DomainException(
+                code="INVALID_DATE_RANGE",
+                message="end_date must be greater than or equal to start_date.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                },
+            )
+
+        scheduled_tasks, unscheduled_tasks = (
+            await self.work_item_repo.get_calendar_tasks(
+                project_id=project_id,
+                start_date=norm_start,
+                end_date=norm_end,
+                assignee_id=assignee_id,
+                status=task_status,
+                include_unscheduled=include_unscheduled,
+            )
+        )
+
+        def _map_calendar_item(task: WorkItem) -> CalendarTaskItem:
+            assignee_dto = (
+                UserActivityActor(
+                    id=task.assignee.id,
+                    email=task.assignee.email,
+                    full_name=task.assignee.full_name,
+                )
+                if task.assignee
+                else None
+            )
+            return CalendarTaskItem(
+                id=task.id,
+                issue_key=task.issue_key,
+                type=task.type,
+                title=task.title,
+                status=task.status,
+                priority=task.priority,
+                start_date=task.start_date,
+                due_date=task.due_date,
+                estimated_points=task.estimated_points,
+                assignee=assignee_dto,
+                milestone_id=task.milestone_id,
+                milestone_name=task.milestone.name if task.milestone else None,
+            )
+
+        scheduled_dtos = [_map_calendar_item(t) for t in scheduled_tasks]
+        unscheduled_dtos = [_map_calendar_item(t) for t in unscheduled_tasks]
+
+        return CalendarResponse(
+            items=scheduled_dtos,
+            unscheduled_items=unscheduled_dtos,
+            total=len(scheduled_dtos),
+            start_date=norm_start,
+            end_date=norm_end,
+        )
+
+    async def get_timeline_view(
+        self,
+        org_id: uuid.UUID,
+        project_id: uuid.UUID,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        include_unscheduled: bool = True,
+    ) -> TimelineResponse:
+        """Batch retrieve tasks, milestones, and dependencies for Timeline/Gantt."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        norm_start = _ensure_utc(start_date)
+        norm_end = _ensure_utc(end_date)
+        if norm_start is not None and norm_end is not None and norm_end < norm_start:
+            raise DomainException(
+                code="INVALID_DATE_RANGE",
+                message="end_date must be greater than or equal to start_date.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        tasks, milestones, dependencies = (
+            await self.work_item_repo.get_timeline_data(
+                project_id=project_id,
+                start_date=start_date,
+                end_date=end_date,
+                include_unscheduled=include_unscheduled,
+            )
+        )
+
+        project_brief = ProjectBrief(
+            id=project.id,
+            name=project.name,
+            key=project.key,
+            organization_id=project.organization_id,
+            is_private=project.is_private,
+        )
+
+        task_dtos = []
+        for t in tasks:
+            assignee_dto = (
+                UserActivityActor(
+                    id=t.assignee.id,
+                    email=t.assignee.email,
+                    full_name=t.assignee.full_name,
+                )
+                if t.assignee
+                else None
+            )
+            has_dates = t.start_date is not None or t.due_date is not None
+            task_dtos.append(
+                TimelineTaskItem(
+                    id=t.id,
+                    issue_key=t.issue_key,
+                    type=t.type,
+                    title=t.title,
+                    status=t.status,
+                    priority=t.priority,
+                    start_date=t.start_date,
+                    due_date=t.due_date,
+                    estimated_points=t.estimated_points,
+                    rank=t.rank,
+                    assignee=assignee_dto,
+                    milestone_id=t.milestone_id,
+                    milestone_name=t.milestone.name if t.milestone else None,
+                    has_dates=has_dates,
+                )
+            )
+
+        milestone_dtos = [
+            TimelineMilestoneItem(
+                id=m.id,
+                name=m.name,
+                description=m.description,
+                target_date=m.target_date,
+                is_completed=m.is_completed,
+            )
+            for m in milestones
+        ]
+
+        dependency_dtos = [
+            TimelineDependencyItem(
+                id=d.id,
+                predecessor_id=d.predecessor_id,
+                successor_id=d.successor_id,
+                dependency_type=d.dependency_type,
+            )
+            for d in dependencies
+        ]
+
+        return TimelineResponse(
+            project=project_brief,
+            tasks=task_dtos,
+            milestones=milestone_dtos,
+            dependencies=dependency_dtos,
+            start_date=start_date,
+            end_date=end_date,
         )
 
 

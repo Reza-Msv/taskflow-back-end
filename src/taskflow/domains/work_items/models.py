@@ -6,6 +6,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -238,6 +239,17 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
     )
+    start_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    milestone_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("milestones.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     estimated_points: Mapped[float | None] = mapped_column(
         Float,
         nullable=True,
@@ -315,6 +327,23 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
         back_populates="work_item",
         cascade="all, delete-orphan",
         order_by="ChecklistItem.position",
+    )
+    milestone: Mapped["Milestone | None"] = relationship(
+        "Milestone",
+        foreign_keys=[milestone_id],
+        back_populates="work_items",
+    )
+    successor_dependencies: Mapped[list["TaskDependency"]] = relationship(
+        "TaskDependency",
+        foreign_keys="TaskDependency.predecessor_id",
+        back_populates="predecessor",
+        cascade="all, delete-orphan",
+    )
+    predecessor_dependencies: Mapped[list["TaskDependency"]] = relationship(
+        "TaskDependency",
+        foreign_keys="TaskDependency.successor_id",
+        back_populates="successor",
+        cascade="all, delete-orphan",
     )
 
 
@@ -513,4 +542,110 @@ class SavedFilter(Base, UUIDMixin, TimestampMixin):
     user: Mapped["User"] = relationship("User")
     organization: Mapped["Organization | None"] = relationship("Organization")
     project: Mapped["Project | None"] = relationship("Project")
+
+
+class Milestone(Base, UUIDMixin, TimestampMixin):
+    """Project-scoped milestone representing a major deliverable or checkpoint."""
+
+    __tablename__ = "milestones"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    target_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    is_completed: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "name",
+            name="uq_milestones_project_name",
+        ),
+    )
+
+    project: Mapped["Project"] = relationship("Project")
+    work_items: Mapped[list["WorkItem"]] = relationship(
+        "WorkItem",
+        back_populates="milestone",
+    )
+
+
+class TaskDependency(Base, UUIDMixin):
+    """Dependency relationship between two tasks within a project."""
+
+    __tablename__ = "task_dependencies"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    predecessor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("work_items.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    successor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("work_items.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    dependency_type: Mapped[str] = mapped_column(
+        String(50),
+        default="finish_to_start",
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "predecessor_id",
+            "successor_id",
+            name="uq_task_dependencies_pred_succ",
+        ),
+        CheckConstraint(
+            "predecessor_id != successor_id",
+            name="ck_task_dependencies_no_self_ref",
+        ),
+    )
+
+    project: Mapped["Project"] = relationship("Project")
+    predecessor: Mapped["WorkItem"] = relationship(
+        "WorkItem",
+        foreign_keys=[predecessor_id],
+        back_populates="successor_dependencies",
+    )
+    successor: Mapped["WorkItem"] = relationship(
+        "WorkItem",
+        foreign_keys=[successor_id],
+        back_populates="predecessor_dependencies",
+    )
+
 
