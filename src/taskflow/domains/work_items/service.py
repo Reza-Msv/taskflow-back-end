@@ -1,12 +1,13 @@
 import math
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from fastapi import UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from taskflow.core.config import settings
 from taskflow.core.exceptions import DomainException
 from taskflow.domains.collaboration.models import Notification
 from taskflow.domains.collaboration.repository import CollaborationRepository
@@ -16,10 +17,15 @@ from taskflow.domains.collaboration.websocket import (
 )
 from taskflow.domains.identity.repository import UserRepository
 from taskflow.domains.organizations.repository import OrganizationRepository
+from taskflow.domains.projects.models import Project
 from taskflow.domains.projects.repository import ProjectRepository
 from taskflow.domains.work_items.models import (
     Attachment,
+    AutomationLog,
+    AutomationRule,
+    RecurringTaskRule,
     SavedFilter,
+    TaskTemplate,
     WorkItem,
 )
 from taskflow.domains.work_items.repository import (
@@ -31,6 +37,13 @@ from taskflow.domains.work_items.repository import (
 from taskflow.domains.work_items.schemas import (
     AttachmentListResponse,
     AttachmentResponse,
+    AutomationDryRunRequest,
+    AutomationDryRunResponse,
+    AutomationRuleCreateRequest,
+    AutomationRuleUpdateRequest,
+    BulkItemError,
+    BulkTaskOperationRequest,
+    BulkTaskOperationResponse,
     CalendarResponse,
     CalendarTaskItem,
     ChecklistItemCreateRequest,
@@ -39,6 +52,7 @@ from taskflow.domains.work_items.schemas import (
     ChecklistListResponse,
     DashboardSummaryResponse,
     GlobalSearchResponse,
+    InstantiateTemplateRequest,
     KanbanBoardResponse,
     KanbanColumn,
     MilestoneBrief,
@@ -49,6 +63,8 @@ from taskflow.domains.work_items.schemas import (
     OverdueUpcomingTasksResponse,
     ProjectBrief,
     ProjectSummary,
+    RecurringTaskRuleCreateRequest,
+    RecurringTaskRuleUpdateRequest,
     SavedFilterCreateRequest,
     SavedFilterUpdateRequest,
     SearchProjectResult,
@@ -60,6 +76,8 @@ from taskflow.domains.work_items.schemas import (
     TaskDependencyResponse,
     TaskFilterCriteria,
     TaskStatusMoveRequest,
+    TaskTemplateCreateRequest,
+    TaskTemplateUpdateRequest,
     TimelineDependencyItem,
     TimelineMilestoneItem,
     TimelineResponse,
@@ -67,7 +85,12 @@ from taskflow.domains.work_items.schemas import (
     UserActivityActor,
     UserActivityItem,
     UserActivityListResponse,
+    WorkflowStatusCreateRequest,
+    WorkflowStatusDetailResponse,
     WorkflowStatusResponse,
+    WorkflowStatusUpdateRequest,
+    WorkflowTransitionCreateRequest,
+    WorkflowTransitionResponse,
     WorkItemActivityResponse,
     WorkItemCreateRequest,
     WorkItemDashboardItem,
@@ -570,6 +593,20 @@ class TaskService:
             offset=offset,
         )
 
+    async def get_project_or_404(
+        self, project_id: uuid.UUID, org_id: uuid.UUID
+    ) -> Project:
+        """Fetch project ensuring organization boundary isolation."""
+        project = await self.project_repo.get_by_id(project_id, org_id=org_id)
+        if project is None:
+            raise DomainException(
+                code="PROJECT_NOT_FOUND",
+                message="Project not found or inaccessible in this organization.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"project_id": str(project_id)},
+            )
+        return project
+
     async def create_task(
         self,
         project_id: uuid.UUID,
@@ -759,8 +796,32 @@ class TaskService:
                 },
             )
 
-        return task
+        # Trigger event automations
+        await self.execute_automations(
+            project_id=project_id,
+            trigger_event="task_created",
+            task=task,
+            actor_id=creator_id,
+            depth=0,
+        )
+        if task.assignee_id:
+            await self.execute_automations(
+                project_id=project_id,
+                trigger_event="task_assigned",
+                task=task,
+                actor_id=creator_id,
+                depth=0,
+            )
+        if task.status.lower() in COMPLETED_STATUSES:
+            await self.execute_automations(
+                project_id=project_id,
+                trigger_event="task_completed",
+                task=task,
+                actor_id=creator_id,
+                depth=0,
+            )
 
+        return task
 
     async def update_task(
         self,
@@ -790,6 +851,7 @@ class TaskService:
             )
 
         # Validate new assignee
+        old_assignee_id = task.assignee_id
         if request.assignee_id is not None and request.assignee_id != task.assignee_id:
             org_member = await self.org_repo.get_membership(
                 task.organization_id, request.assignee_id
@@ -1003,7 +1065,6 @@ class TaskService:
             task.milestone_id = request.milestone_id
             mutated = True
 
-
         if (
             request.estimated_points is not None
             and request.estimated_points != task.estimated_points
@@ -1024,7 +1085,6 @@ class TaskService:
             "sprint_id" in request.model_fields_set
             and request.sprint_id != task.sprint_id
         ):
-
             old_sprint_val = str(task.sprint_id) if task.sprint_id else None
             new_sprint_val = str(request.sprint_id) if request.sprint_id else None
             await self.work_item_repo.record_activity(
@@ -1117,8 +1177,16 @@ class TaskService:
                     },
                 )
 
-        return task
+        if request.assignee_id is not None and request.assignee_id != old_assignee_id:
+            await self.execute_automations(
+                project_id=project_id,
+                trigger_event="task_assigned",
+                task=task,
+                actor_id=actor_id,
+                depth=0,
+            )
 
+        return task
 
     async def move_task_status(
         self,
@@ -1160,11 +1228,40 @@ class TaskService:
                 details={"status": request.status},
             )
 
-        new_status_name = (
-            target_status_obj.category.lower()
-            if target_status_obj.category
-            else target_status_obj.name.lower().replace(" ", "_")
+        if target_status_obj.name.lower() in ("to do", "todo"):
+            new_status_name = "todo"
+        elif target_status_obj.name.lower() in ("in progress", "in_progress"):
+            new_status_name = "in_progress"
+        elif target_status_obj.name.lower() in ("done",):
+            new_status_name = "done"
+        else:
+            new_status_name = target_status_obj.name
+        old_status = task.status
+
+        # Validate dependency blocking if moving to completed status
+        is_completing = new_status_name.lower() in COMPLETED_STATUSES or (
+            target_status_obj.category
+            and target_status_obj.category.lower() in COMPLETED_STATUSES
         )
+        if is_completing and new_status_name != task.status:
+            incomplete_preds = await self.work_item_repo.get_incomplete_predecessors(
+                task.id
+            )
+            if incomplete_preds:
+                pred_keys = [p.issue_key for p in incomplete_preds]
+                raise DomainException(
+                    code="TASK_BLOCKED_BY_DEPENDENCY",
+                    message=(
+                        f"Task '{task.issue_key}' cannot be completed because it has "
+                        f"unfinished predecessor tasks: {', '.join(pred_keys)}."
+                    ),
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    details={
+                        "task_id": str(task.id),
+                        "blocked_by": [str(p.id) for p in incomplete_preds],
+                        "blocked_by_keys": pred_keys,
+                    },
+                )
 
         # Validate workflow transition policy if transitions are configured
         if new_status_name != task.status:
@@ -1260,9 +1357,7 @@ class TaskService:
                     "id": str(status_notif.id),
                     "user_id": str(status_notif.user_id),
                     "actor_id": (
-                        str(status_notif.actor_id)
-                        if status_notif.actor_id
-                        else None
+                        str(status_notif.actor_id) if status_notif.actor_id else None
                     ),
                     "organization_id": (
                         str(status_notif.organization_id)
@@ -1284,8 +1379,24 @@ class TaskService:
                 },
             )
 
-        return task
+        if new_status_name != old_status:
+            await self.execute_automations(
+                project_id=project_id,
+                trigger_event="task_status_changed",
+                task=task,
+                actor_id=actor_id,
+                depth=0,
+            )
+            if task.status.lower() in COMPLETED_STATUSES:
+                await self.execute_automations(
+                    project_id=project_id,
+                    trigger_event="task_completed",
+                    task=task,
+                    actor_id=actor_id,
+                    depth=0,
+                )
 
+        return task
 
     async def delete_task(
         self,
@@ -1493,9 +1604,7 @@ class TaskService:
         comments_count = len(task.comments) if task.comments else 0
 
         milestone_dto = (
-            MilestoneBrief.model_validate(task.milestone)
-            if task.milestone
-            else None
+            MilestoneBrief.model_validate(task.milestone) if task.milestone else None
         )
         dependencies_dto = TaskDependenciesSummary(
             predecessors=[
@@ -2461,15 +2570,16 @@ class TaskService:
                 },
             )
 
-        scheduled_tasks, unscheduled_tasks = (
-            await self.work_item_repo.get_calendar_tasks(
-                project_id=project_id,
-                start_date=norm_start,
-                end_date=norm_end,
-                assignee_id=assignee_id,
-                status=task_status,
-                include_unscheduled=include_unscheduled,
-            )
+        (
+            scheduled_tasks,
+            unscheduled_tasks,
+        ) = await self.work_item_repo.get_calendar_tasks(
+            project_id=project_id,
+            start_date=norm_start,
+            end_date=norm_end,
+            assignee_id=assignee_id,
+            status=task_status,
+            include_unscheduled=include_unscheduled,
         )
 
         def _map_calendar_item(task: WorkItem) -> CalendarTaskItem:
@@ -2534,13 +2644,11 @@ class TaskService:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
-        tasks, milestones, dependencies = (
-            await self.work_item_repo.get_timeline_data(
-                project_id=project_id,
-                start_date=start_date,
-                end_date=end_date,
-                include_unscheduled=include_unscheduled,
-            )
+        tasks, milestones, dependencies = await self.work_item_repo.get_timeline_data(
+            project_id=project_id,
+            start_date=start_date,
+            end_date=end_date,
+            include_unscheduled=include_unscheduled,
         )
 
         project_brief = ProjectBrief(
@@ -2612,6 +2720,1155 @@ class TaskService:
             end_date=end_date,
         )
 
+    # ---------------- Phase 11: Workflow Policies ---------------- #
+
+    async def create_workflow_status(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        request: WorkflowStatusCreateRequest,
+    ) -> WorkflowStatusDetailResponse:
+        """Create a custom workflow status for a project."""
+        await self.get_project_or_404(project_id, org_id)
+        status_obj = await self.work_item_repo.create_workflow_status(
+            project_id=project_id,
+            name=request.name.strip(),
+            category=request.category,
+            position=request.position,
+            is_default=request.is_default,
+        )
+        await self.session.commit()
+        await self.session.refresh(status_obj)
+        return WorkflowStatusDetailResponse(
+            id=status_obj.id,
+            project_id=status_obj.project_id,
+            name=status_obj.name,
+            category=status_obj.category,
+            position=status_obj.position,
+            is_default=status_obj.is_default,
+            created_at=status_obj.created_at,
+            updated_at=status_obj.updated_at,
+            allowed_transitions=[],
+        )
+
+    async def list_workflow_statuses(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> list[WorkflowStatusDetailResponse]:
+        """List all workflow statuses with permitted transitions for a project."""
+        await self.get_project_or_404(project_id, org_id)
+        await self.work_item_repo.ensure_default_workflow_statuses(project_id)
+        statuses = await self.work_item_repo.get_project_statuses(project_id)
+        transitions = await self.work_item_repo.list_transitions_for_project(project_id)
+
+        transitions_by_from: dict[uuid.UUID, list[WorkflowTransitionResponse]] = {}
+        for t in transitions:
+            dto = WorkflowTransitionResponse.model_validate(t)
+            transitions_by_from.setdefault(t.from_status_id, []).append(dto)
+
+        result: list[WorkflowStatusDetailResponse] = []
+        for s in statuses:
+            result.append(
+                WorkflowStatusDetailResponse(
+                    id=s.id,
+                    project_id=s.project_id,
+                    name=s.name,
+                    category=s.category,
+                    position=s.position,
+                    is_default=s.is_default,
+                    created_at=s.created_at,
+                    updated_at=s.updated_at,
+                    allowed_transitions=transitions_by_from.get(s.id, []),
+                )
+            )
+        return result
+
+    async def update_workflow_status(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        status_id: uuid.UUID,
+        request: WorkflowStatusUpdateRequest,
+    ) -> WorkflowStatusDetailResponse:
+        """Update properties of an existing custom workflow status."""
+        await self.get_project_or_404(project_id, org_id)
+        status_obj = await self.work_item_repo.get_workflow_status_by_id(
+            status_id, project_id=project_id
+        )
+        if status_obj is None or status_obj.project_id != project_id:
+            raise DomainException(
+                code="STATUS_NOT_FOUND",
+                message="Workflow status not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"status_id": str(status_id)},
+            )
+
+        kwargs: dict[str, Any] = {}
+        if request.name is not None:
+            kwargs["name"] = request.name.strip()
+        if request.category is not None:
+            kwargs["category"] = request.category
+        if request.position is not None:
+            kwargs["position"] = request.position
+        if request.is_default is not None:
+            kwargs["is_default"] = request.is_default
+
+        updated = await self.work_item_repo.update_workflow_status(status_obj, **kwargs)
+        await self.session.commit()
+        await self.session.refresh(updated)
+
+        transitions = await self.work_item_repo.get_allowed_transitions(updated.id)
+        return WorkflowStatusDetailResponse(
+            id=updated.id,
+            project_id=updated.project_id,
+            name=updated.name,
+            category=updated.category,
+            position=updated.position,
+            is_default=updated.is_default,
+            created_at=updated.created_at,
+            updated_at=updated.updated_at,
+            allowed_transitions=[
+                WorkflowTransitionResponse.model_validate(t) for t in transitions
+            ],
+        )
+
+    async def delete_workflow_status(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        status_id: uuid.UUID,
+    ) -> None:
+        """Delete a custom workflow status if not in active use."""
+        await self.get_project_or_404(project_id, org_id)
+        status_obj = await self.work_item_repo.get_workflow_status_by_id(
+            status_id, project_id=project_id
+        )
+        if status_obj is None or status_obj.project_id != project_id:
+            raise DomainException(
+                code="STATUS_NOT_FOUND",
+                message="Workflow status not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"status_id": str(status_id)},
+            )
+
+        if status_obj.is_default:
+            raise DomainException(
+                code="CANNOT_DELETE_DEFAULT_STATUS",
+                message="Cannot delete the default workflow status for a project.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        task_count = await self.work_item_repo.count_tasks_in_status(
+            project_id, status_obj.name
+        )
+        if task_count > 0:
+            raise DomainException(
+                code="STATUS_IN_USE",
+                message=(
+                    f"Cannot delete status '{status_obj.name}' because it contains "
+                    f"{task_count} active tasks. Please reassign tasks first."
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={"task_count": task_count},
+            )
+
+        await self.work_item_repo.delete_workflow_status(status_obj)
+        await self.session.commit()
+
+    async def create_workflow_transition(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        request: WorkflowTransitionCreateRequest,
+    ) -> WorkflowTransitionResponse:
+        """Define an explicit permitted transition between workflow statuses."""
+        await self.get_project_or_404(project_id, org_id)
+        from_st = await self.work_item_repo.get_workflow_status_by_id(
+            request.from_status_id, project_id=project_id
+        )
+        to_st = await self.work_item_repo.get_workflow_status_by_id(
+            request.to_status_id, project_id=project_id
+        )
+        if from_st is None or to_st is None:
+            raise DomainException(
+                code="STATUS_NOT_FOUND",
+                message="Source or destination status not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        existing = await self.work_item_repo.get_transition_by_from_to(
+            request.from_status_id, request.to_status_id
+        )
+        if existing is not None:
+            raise DomainException(
+                code="TRANSITION_ALREADY_EXISTS",
+                message="This status transition rule is already configured.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+
+        trans = await self.work_item_repo.create_workflow_transition(
+            from_status_id=request.from_status_id,
+            to_status_id=request.to_status_id,
+            name=request.name.strip() if request.name else None,
+        )
+        await self.session.commit()
+        await self.session.refresh(trans)
+        return WorkflowTransitionResponse.model_validate(trans)
+
+    async def list_workflow_transitions(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> list[WorkflowTransitionResponse]:
+        """List all configured status transitions for a project."""
+        await self.get_project_or_404(project_id, org_id)
+        transitions = await self.work_item_repo.list_transitions_for_project(project_id)
+        return [WorkflowTransitionResponse.model_validate(t) for t in transitions]
+
+    async def delete_workflow_transition(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        transition_id: uuid.UUID,
+    ) -> None:
+        """Remove a configured workflow transition rule."""
+        await self.get_project_or_404(project_id, org_id)
+        trans = await self.work_item_repo.get_workflow_transition_by_id(transition_id)
+        if trans is None:
+            raise DomainException(
+                code="TRANSITION_NOT_FOUND",
+                message="Workflow transition rule not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"transition_id": str(transition_id)},
+            )
+        await self.work_item_repo.delete_workflow_transition(trans)
+        await self.session.commit()
+
+    # ---------------- Phase 11: Task Templates ---------------- #
+
+    async def create_template(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        creator_id: uuid.UUID,
+        request: TaskTemplateCreateRequest,
+    ) -> TaskTemplate:
+        """Create a reusable task blueprint in a project."""
+        await self.get_project_or_404(project_id, org_id)
+        existing = await self.work_item_repo.get_template_by_name(
+            project_id, request.name
+        )
+        if existing is not None:
+            raise DomainException(
+                code="TEMPLATE_NAME_EXISTS",
+                message=(
+                    f"Template with name '{request.name}' already exists in project."
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+                details={"name": request.name},
+            )
+
+        template = await self.work_item_repo.create_template(
+            project_id=project_id,
+            organization_id=org_id,
+            name=request.name.strip(),
+            task_title=request.task_title.strip(),
+            description=request.description.strip() if request.description else None,
+            task_description=(
+                request.task_description.strip() if request.task_description else None
+            ),
+            task_type=request.task_type,
+            priority=request.priority,
+            estimated_points=request.estimated_points,
+            checklist_definitions=request.checklist_definitions,
+            default_assignee_id=request.default_assignee_id,
+            created_by_id=creator_id,
+        )
+        await self.session.commit()
+        await self.session.refresh(template)
+        return template
+
+    async def get_template(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        template_id: uuid.UUID,
+    ) -> TaskTemplate:
+        """Get a specific task template by ID."""
+        await self.get_project_or_404(project_id, org_id)
+        template = await self.work_item_repo.get_template(
+            template_id, project_id=project_id
+        )
+        if template is None:
+            raise DomainException(
+                code="TEMPLATE_NOT_FOUND",
+                message="Task template not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"template_id": str(template_id)},
+            )
+        return template
+
+    async def list_templates(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> list[TaskTemplate]:
+        """List all task templates defined in a project."""
+        await self.get_project_or_404(project_id, org_id)
+        return await self.work_item_repo.list_templates(project_id)
+
+    async def update_template(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        template_id: uuid.UUID,
+        request: TaskTemplateUpdateRequest,
+    ) -> TaskTemplate:
+        """Update blueprint attributes of an existing task template."""
+        template = await self.get_template(project_id, org_id, template_id)
+
+        kwargs: dict[str, Any] = {}
+        if request.name is not None and request.name.strip() != template.name:
+            dup = await self.work_item_repo.get_template_by_name(
+                project_id, request.name
+            )
+            if dup is not None and dup.id != template.id:
+                raise DomainException(
+                    code="TEMPLATE_NAME_EXISTS",
+                    message=(f"Template with name '{request.name}' already exists."),
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            kwargs["name"] = request.name.strip()
+
+        if request.description is not None:
+            kwargs["description"] = (
+                request.description.strip() if request.description else None
+            )
+        if request.task_title is not None:
+            kwargs["task_title"] = request.task_title.strip()
+        if request.task_description is not None:
+            kwargs["task_description"] = (
+                request.task_description.strip() if request.task_description else None
+            )
+        if request.task_type is not None:
+            kwargs["task_type"] = request.task_type
+        if request.priority is not None:
+            kwargs["priority"] = request.priority
+        if request.estimated_points is not None:
+            kwargs["estimated_points"] = request.estimated_points
+        if request.checklist_definitions is not None:
+            kwargs["checklist_definitions"] = request.checklist_definitions
+        if "default_assignee_id" in request.model_fields_set:
+            kwargs["default_assignee_id"] = request.default_assignee_id
+
+        updated = await self.work_item_repo.update_template(template, **kwargs)
+        await self.session.commit()
+        await self.session.refresh(updated)
+        return updated
+
+    async def delete_template(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        template_id: uuid.UUID,
+    ) -> None:
+        """Delete a task template from a project."""
+        template = await self.get_template(project_id, org_id, template_id)
+        await self.work_item_repo.delete_template(template)
+        await self.session.commit()
+
+    async def instantiate_template(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        template_id: uuid.UUID,
+        request: InstantiateTemplateRequest,
+    ) -> WorkItem:
+        """
+        Instantiate a new task from a template blueprint.
+        Copies core fields and checklist items, without copying IDs or comments.
+        """
+        template = await self.get_template(project_id, org_id, template_id)
+
+        task_create_req = WorkItemCreateRequest(
+            title=request.title.strip() if request.title else template.task_title,
+            description=template.task_description,
+            type=template.task_type,
+            priority=template.priority,
+            estimated_points=float(template.estimated_points)
+            if template.estimated_points is not None
+            else None,
+            assignee_id=(
+                request.assignee_id
+                if request.assignee_id is not None
+                else template.default_assignee_id
+            ),
+            sprint_id=request.sprint_id,
+            due_date=request.due_date,
+        )
+
+        task = await self.create_task(
+            project_id=project_id,
+            org_id=org_id,
+            creator_id=actor_id,
+            request=task_create_req,
+        )
+
+        # Clone checklist definitions if present
+        if template.checklist_definitions:
+            for idx, item_def in enumerate(template.checklist_definitions):
+                title = (
+                    item_def.get("title", f"Checklist item {idx + 1}")
+                    if isinstance(item_def, dict)
+                    else str(item_def)
+                )
+                c_assignee_raw = (
+                    item_def.get("assignee_id") if isinstance(item_def, dict) else None
+                )
+                c_assignee = uuid.UUID(str(c_assignee_raw)) if c_assignee_raw else None
+                await self.work_item_repo.create_checklist_item(
+                    work_item_id=task.id,
+                    title=title,
+                    position=idx,
+                    assignee_id=c_assignee,
+                )
+            await self.session.commit()
+            await self.session.refresh(task)
+
+        return task
+
+    # ---------------- Phase 11: Recurring Tasks ---------------- #
+
+    def _calculate_next_run(
+        self, rule: RecurringTaskRule, base_time: datetime | None = None
+    ) -> datetime:
+        """Calculate next execution timestamp based on pattern and interval."""
+        base = base_time or rule.next_run_at or datetime.now(UTC)
+        interval = max(1, rule.interval_value)
+        pattern = rule.recurrence_pattern.lower()
+
+        if pattern == "daily":
+            return base + timedelta(days=interval)
+        elif pattern == "weekly":
+            return base + timedelta(weeks=interval)
+        elif pattern == "monthly":
+            return base + timedelta(days=30 * interval)
+        else:
+            return base + timedelta(days=interval)
+
+    async def create_recurring_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        creator_id: uuid.UUID,
+        request: RecurringTaskRuleCreateRequest,
+    ) -> RecurringTaskRule:
+        """Create a scheduled recurring task generation rule."""
+        await self.get_project_or_404(project_id, org_id)
+
+        next_run = request.next_run_at or datetime.now(UTC)
+        rule = await self.work_item_repo.create_recurring_rule(
+            project_id=project_id,
+            organization_id=org_id,
+            title=request.title.strip(),
+            description=request.description.strip() if request.description else None,
+            type=request.type,
+            priority=request.priority,
+            estimated_points=request.estimated_points,
+            assignee_id=request.assignee_id,
+            recurrence_pattern=request.recurrence_pattern,
+            interval_value=request.interval_value,
+            timezone=request.timezone,
+            next_run_at=next_run,
+            is_active=request.is_active,
+            created_by_id=creator_id,
+        )
+        await self.session.commit()
+        await self.session.refresh(rule)
+        return rule
+
+    async def get_recurring_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID,
+    ) -> RecurringTaskRule:
+        """Get a specific recurring task rule by ID."""
+        await self.get_project_or_404(project_id, org_id)
+        rule = await self.work_item_repo.get_recurring_rule(
+            rule_id, project_id=project_id
+        )
+        if rule is None:
+            raise DomainException(
+                code="RECURRING_RULE_NOT_FOUND",
+                message="Recurring task rule not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"rule_id": str(rule_id)},
+            )
+        return rule
+
+    async def list_recurring_rules(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        active_only: bool = False,
+    ) -> list[RecurringTaskRule]:
+        """List all recurring task rules defined in a project."""
+        await self.get_project_or_404(project_id, org_id)
+        return await self.work_item_repo.list_recurring_rules(
+            project_id, active_only=active_only
+        )
+
+    async def update_recurring_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID,
+        request: RecurringTaskRuleUpdateRequest,
+    ) -> RecurringTaskRule:
+        """Update scheduling or blueprint fields of a recurring task rule."""
+        rule = await self.get_recurring_rule(project_id, org_id, rule_id)
+
+        kwargs: dict[str, Any] = {}
+        if request.title is not None:
+            kwargs["title"] = request.title.strip()
+        if request.description is not None:
+            kwargs["description"] = (
+                request.description.strip() if request.description else None
+            )
+        if request.type is not None:
+            kwargs["type"] = request.type
+        if request.priority is not None:
+            kwargs["priority"] = request.priority
+        if request.estimated_points is not None:
+            kwargs["estimated_points"] = request.estimated_points
+        if "assignee_id" in request.model_fields_set:
+            kwargs["assignee_id"] = request.assignee_id
+        if request.recurrence_pattern is not None:
+            kwargs["recurrence_pattern"] = request.recurrence_pattern
+        if request.interval_value is not None:
+            kwargs["interval_value"] = request.interval_value
+        if request.timezone is not None:
+            kwargs["timezone"] = request.timezone
+        if request.next_run_at is not None:
+            kwargs["next_run_at"] = request.next_run_at
+        if request.is_active is not None:
+            kwargs["is_active"] = request.is_active
+
+        updated = await self.work_item_repo.update_recurring_rule(rule, **kwargs)
+        await self.session.commit()
+        await self.session.refresh(updated)
+        return updated
+
+    async def delete_recurring_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID,
+    ) -> None:
+        """Delete a recurring task rule from a project."""
+        rule = await self.get_recurring_rule(project_id, org_id, rule_id)
+        await self.work_item_repo.delete_recurring_rule(rule)
+        await self.session.commit()
+
+    async def trigger_recurring_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        rule_id: uuid.UUID,
+    ) -> tuple[WorkItem, RecurringTaskRule]:
+        """
+        Manually or periodically trigger a recurring rule:
+        Instantiates the task, advances next_run_at, and records last_run_at.
+        """
+        rule = await self.get_recurring_rule(project_id, org_id, rule_id)
+
+        task_create_req = WorkItemCreateRequest(
+            title=rule.title,
+            description=rule.description,
+            type=rule.type,
+            priority=rule.priority,
+            estimated_points=float(rule.estimated_points)
+            if rule.estimated_points is not None
+            else None,
+            assignee_id=rule.assignee_id,
+        )
+
+        task = await self.create_task(
+            project_id=project_id,
+            org_id=org_id,
+            creator_id=actor_id,
+            request=task_create_req,
+        )
+
+        now = datetime.now(UTC)
+        rule.last_run_at = now
+        rule.next_run_at = self._calculate_next_run(rule, base_time=now)
+        await self.session.commit()
+        await self.session.refresh(rule)
+
+        return task, rule
+
+    # ---------------- Phase 11: Automation Rules & Engine ---------------- #
+
+    async def create_automation_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        creator_id: uuid.UUID,
+        request: AutomationRuleCreateRequest,
+    ) -> AutomationRule:
+        """Create a new event automation rule in a project."""
+        await self.get_project_or_404(project_id, org_id)
+
+        rule = await self.work_item_repo.create_automation_rule(
+            project_id=project_id,
+            organization_id=org_id,
+            name=request.name.strip(),
+            trigger_event=request.trigger_event,
+            action_type=request.action_type,
+            action_payload=request.action_payload,
+            trigger_conditions=request.trigger_conditions,
+            description=request.description.strip() if request.description else None,
+            is_active=request.is_active,
+            created_by_id=creator_id,
+        )
+        await self.session.commit()
+        await self.session.refresh(rule)
+        return rule
+
+    async def get_automation_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID,
+    ) -> AutomationRule:
+        """Get a specific automation rule by ID."""
+        await self.get_project_or_404(project_id, org_id)
+        rule = await self.work_item_repo.get_automation_rule(
+            rule_id, project_id=project_id
+        )
+        if rule is None:
+            raise DomainException(
+                code="AUTOMATION_RULE_NOT_FOUND",
+                message="Automation rule not found in this project.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                details={"rule_id": str(rule_id)},
+            )
+        return rule
+
+    async def list_automation_rules(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        trigger_event: str | None = None,
+    ) -> list[AutomationRule]:
+        """List all automation rules configured in a project."""
+        await self.get_project_or_404(project_id, org_id)
+        return await self.work_item_repo.list_automation_rules(
+            project_id, trigger_event=trigger_event
+        )
+
+    async def update_automation_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID,
+        request: AutomationRuleUpdateRequest,
+    ) -> AutomationRule:
+        """Update trigger or action parameters of an automation rule."""
+        rule = await self.get_automation_rule(project_id, org_id, rule_id)
+
+        kwargs: dict[str, Any] = {}
+        if request.name is not None:
+            kwargs["name"] = request.name.strip()
+        if request.description is not None:
+            kwargs["description"] = (
+                request.description.strip() if request.description else None
+            )
+        if request.trigger_event is not None:
+            kwargs["trigger_event"] = request.trigger_event
+        if "trigger_conditions" in request.model_fields_set:
+            kwargs["trigger_conditions"] = request.trigger_conditions
+        if request.action_type is not None:
+            kwargs["action_type"] = request.action_type
+        if request.action_payload is not None:
+            kwargs["action_payload"] = request.action_payload
+        if request.is_active is not None:
+            kwargs["is_active"] = request.is_active
+
+        updated = await self.work_item_repo.update_automation_rule(rule, **kwargs)
+        await self.session.commit()
+        await self.session.refresh(updated)
+        return updated
+
+    async def delete_automation_rule(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID,
+    ) -> None:
+        """Delete an automation rule from a project."""
+        rule = await self.get_automation_rule(project_id, org_id, rule_id)
+        await self.work_item_repo.delete_automation_rule(rule)
+        await self.session.commit()
+
+    async def list_automation_logs(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID | None = None,
+        limit: int = 50,
+    ) -> list[AutomationLog]:
+        """List execution audit history logs for automations in a project."""
+        await self.get_project_or_404(project_id, org_id)
+        return await self.work_item_repo.list_automation_logs(
+            project_id, rule_id=rule_id, limit=limit
+        )
+
+    async def dry_run_automation(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        rule_id: uuid.UUID,
+        request: AutomationDryRunRequest,
+    ) -> AutomationDryRunResponse:
+        """
+        Simulate an automation rule against a task without persisting modifications.
+        """
+        rule = await self.get_automation_rule(project_id, org_id, rule_id)
+        task = await self.get_task_by_id(request.work_item_id, project_id=project_id)
+
+        matched = True
+        reason = "Task satisfies rule trigger conditions."
+        if rule.trigger_conditions:
+            for field_name, expected_val in rule.trigger_conditions.items():
+                task_val = getattr(task, field_name, None)
+                if task_val is None and field_name == "assignee_id":
+                    task_val = str(task.assignee_id) if task.assignee_id else None
+                if str(task_val).lower() != str(expected_val).lower():
+                    matched = False
+                    reason = (
+                        f"Field '{field_name}' had value '{task_val}', "
+                        f"expected '{expected_val}'."
+                    )
+                    break
+
+        projected: dict[str, Any] = {}
+        if matched:
+            projected = {rule.action_type: rule.action_payload}
+
+        return AutomationDryRunResponse(
+            matched=matched,
+            action_type=rule.action_type,
+            projected_action=projected,
+            reason=reason,
+        )
+
+    async def execute_automations(
+        self,
+        project_id: uuid.UUID,
+        trigger_event: str,
+        task: WorkItem,
+        actor_id: uuid.UUID | None = None,
+        depth: int = 0,
+    ) -> None:
+        """
+        Evaluate and execute active automation rules for a triggered event.
+        Guarded against infinite cascade loops with max execution depth of 2.
+        """
+        if depth > 1:
+            return
+
+        rules = await self.work_item_repo.list_automation_rules(
+            project_id=project_id,
+            trigger_event=trigger_event,
+            active_only=True,
+        )
+        if not rules:
+            return
+
+        for rule in rules:
+            # Evaluate trigger conditions
+            matched = True
+            if rule.trigger_conditions:
+                for field_name, expected_val in rule.trigger_conditions.items():
+                    actual_val = getattr(task, field_name, None)
+                    if actual_val is None and field_name == "assignee_id":
+                        actual_val = str(task.assignee_id) if task.assignee_id else None
+                    if str(actual_val).lower() != str(expected_val).lower():
+                        matched = False
+                        break
+
+            if not matched:
+                continue
+
+            action_type = rule.action_type
+            payload = rule.action_payload
+            action_desc = f"Executed {action_type}"
+            details: dict[str, Any] = {"payload": payload}
+
+            try:
+                if action_type == "assign_user":
+                    user_id_raw = payload.get("user_id")
+                    if user_id_raw:
+                        target_user = uuid.UUID(str(user_id_raw))
+                        task.assignee_id = target_user
+                        action_desc = f"Assigned task to user {target_user}"
+                        await self.work_item_repo.record_activity(
+                            task.id, actor_id, "assignee_id", None, str(target_user)
+                        )
+                        if depth == 0:
+                            await self.execute_automations(
+                                project_id,
+                                "task_assigned",
+                                task,
+                                actor_id,
+                                depth=depth + 1,
+                            )
+
+                elif action_type == "change_status":
+                    status_name = payload.get("status")
+                    if status_name:
+                        st_obj = await self.work_item_repo.get_status_by_name_or_id(
+                            project_id, status_name
+                        )
+                        target_status = (
+                            st_obj.category.lower()
+                            if st_obj and st_obj.category
+                            else status_name.lower().replace(" ", "_")
+                        )
+                        old_status = task.status
+                        task.status = target_status
+                        if target_status in COMPLETED_STATUSES:
+                            task.completed_at = datetime.now(UTC)
+                        action_desc = f"Changed status to {target_status}"
+                        await self.work_item_repo.record_activity(
+                            task.id, actor_id, "status", old_status, target_status
+                        )
+                        if depth == 0:
+                            await self.execute_automations(
+                                project_id,
+                                "task_status_changed",
+                                task,
+                                actor_id,
+                                depth=depth + 1,
+                            )
+                            if target_status in COMPLETED_STATUSES:
+                                await self.execute_automations(
+                                    project_id,
+                                    "task_completed",
+                                    task,
+                                    actor_id,
+                                    depth=depth + 1,
+                                )
+
+                elif action_type == "update_priority":
+                    new_priority = payload.get("priority")
+                    if new_priority:
+                        old_pri = task.priority
+                        task.priority = new_priority
+                        action_desc = f"Updated priority to {new_priority}"
+                        await self.work_item_repo.record_activity(
+                            task.id, actor_id, "priority", old_pri, new_priority
+                        )
+
+                elif action_type == "send_notification":
+                    notif_user_id = payload.get("user_id")
+                    notif_msg = payload.get(
+                        "message", f"Automation alert for {task.issue_key}"
+                    )
+                    notif_title = payload.get("title", f"Automation Rule: {rule.name}")
+                    if notif_user_id:
+                        target_notif_user = uuid.UUID(str(notif_user_id))
+                        await self.collab_repo.create_notification(
+                            user_id=target_notif_user,
+                            actor_id=actor_id,
+                            organization_id=task.organization_id,
+                            type="automation_triggered",
+                            title=notif_title,
+                            message=notif_msg,
+                            resource_type="task",
+                            resource_id=task.id,
+                        )
+                        action_desc = f"Sent notification to user {target_notif_user}"
+
+                rule.execution_count += 1
+                rule.last_executed_at = datetime.now(UTC)
+                await self.work_item_repo.create_automation_log(
+                    rule_id=rule.id,
+                    project_id=project_id,
+                    work_item_id=task.id,
+                    trigger_event=trigger_event,
+                    status="success",
+                    action_taken=action_desc,
+                    details=details,
+                )
+                await self.session.commit()
+
+            except Exception as exc:
+                await self.work_item_repo.create_automation_log(
+                    rule_id=rule.id,
+                    project_id=project_id,
+                    work_item_id=task.id,
+                    trigger_event=trigger_event,
+                    status="failed",
+                    action_taken=f"Failed to execute {rule.action_type}",
+                    error_message=str(exc),
+                )
+                await self.session.commit()
+
+    # ---------------- Phase 11: Bulk Task Operations ---------------- #
+
+    async def execute_bulk_operation(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        request: BulkTaskOperationRequest,
+    ) -> BulkTaskOperationResponse:
+        """
+        Execute bounded bulk operations across multiple project tasks.
+        Validates project boundaries, workflow policies, and dependency constraints.
+        """
+        await self.get_project_or_404(project_id, org_id)
+
+        if len(request.task_ids) > settings.MAX_BULK_UPDATE_LIMIT:
+            raise DomainException(
+                code="BULK_LIMIT_EXCEEDED",
+                message=(
+                    f"Requested {len(request.task_ids)} tasks exceeds max "
+                    f"allowed limit of {settings.MAX_BULK_UPDATE_LIMIT}."
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={
+                    "max_limit": settings.MAX_BULK_UPDATE_LIMIT,
+                    "submitted_count": len(request.task_ids),
+                },
+            )
+
+        successful_ids: list[uuid.UUID] = []
+        errors: list[BulkItemError] = []
+
+        for tid in request.task_ids:
+            task = await self.work_item_repo.get_by_id(tid)
+            if (
+                task is None
+                or task.project_id != project_id
+                or task.organization_id != org_id
+            ):
+                errors.append(
+                    BulkItemError(
+                        task_id=tid,
+                        error_code="TASK_NOT_FOUND",
+                        detail="Task not found in the target project.",
+                    )
+                )
+                continue
+
+            op = request.operation
+            payload = request.payload
+
+            if op == "update_status":
+                target_status_name = payload.get("status")
+                if not target_status_name:
+                    errors.append(
+                        BulkItemError(
+                            task_id=tid,
+                            error_code="INVALID_PAYLOAD",
+                            detail="Missing 'status' in payload.",
+                        )
+                    )
+                    continue
+
+                target_st_obj = await self.work_item_repo.get_status_by_name_or_id(
+                    project_id, target_status_name
+                )
+                if target_st_obj is None:
+                    errors.append(
+                        BulkItemError(
+                            task_id=tid,
+                            error_code="INVALID_STATUS",
+                            detail=(
+                                f"Status '{target_status_name}' is not recognized."
+                            ),
+                        )
+                    )
+                    continue
+
+                if target_st_obj.name.lower() in ("to do", "todo"):
+                    new_st = "todo"
+                elif target_st_obj.name.lower() in ("in progress", "in_progress"):
+                    new_st = "in_progress"
+                elif target_st_obj.name.lower() in ("done",):
+                    new_st = "done"
+                else:
+                    new_st = target_st_obj.name
+
+                # Check dependency blocking
+                is_completed = new_st in COMPLETED_STATUSES or (
+                    target_st_obj.category
+                    and target_st_obj.category.lower() in COMPLETED_STATUSES
+                )
+                if is_completed:
+                    incomplete_preds = (
+                        await self.work_item_repo.get_incomplete_predecessors(task.id)
+                    )
+                    if incomplete_preds:
+                        pred_keys = [p.issue_key for p in incomplete_preds]
+                        errors.append(
+                            BulkItemError(
+                                task_id=tid,
+                                error_code="TASK_BLOCKED_BY_DEPENDENCY",
+                                detail=(
+                                    f"Task is blocked by incomplete tasks: "
+                                    f"{', '.join(pred_keys)}."
+                                ),
+                            )
+                        )
+                        continue
+
+                # Check workflow transitions if configured
+                has_trans = await self.work_item_repo.has_configured_transitions(
+                    project_id
+                )
+                if has_trans and new_st != task.status:
+                    curr_st_obj = await self.work_item_repo.get_status_by_name_or_id(
+                        project_id, task.status
+                    )
+                    if curr_st_obj is not None:
+                        allowed_transitions = (
+                            await self.work_item_repo.get_allowed_transitions(
+                                curr_st_obj.id
+                            )
+                        )
+                        allowed_to_ids = {t.to_status_id for t in allowed_transitions}
+                        if target_st_obj.id not in allowed_to_ids:
+                            errors.append(
+                                BulkItemError(
+                                    task_id=tid,
+                                    error_code="INVALID_STATUS_TRANSITION",
+                                    detail=(
+                                        f"Transition from '{task.status}' to "
+                                        f"'{target_status_name}' is not permitted."
+                                    ),
+                                )
+                            )
+                            continue
+
+                old_st = task.status
+                task.status = new_st
+                task.completed_at = datetime.now(UTC) if is_completed else None
+                await self.work_item_repo.record_activity(
+                    task.id, actor_id, "status", old_st, new_st
+                )
+                successful_ids.append(tid)
+
+            elif op == "assign_user":
+                target_uid_raw = payload.get("assignee_id")
+                if target_uid_raw is not None:
+                    try:
+                        user_uuid = uuid.UUID(str(target_uid_raw))
+                        mem = await self.org_repo.get_membership(org_id, user_uuid)
+                        if mem is None or not mem.is_active:
+                            errors.append(
+                                BulkItemError(
+                                    task_id=tid,
+                                    error_code="INVALID_ASSIGNEE",
+                                    detail="Assignee is not an active member.",
+                                )
+                            )
+                            continue
+                        old_ass = str(task.assignee_id) if task.assignee_id else None
+                        task.assignee_id = user_uuid
+                        await self.work_item_repo.record_activity(
+                            task.id, actor_id, "assignee_id", old_ass, str(user_uuid)
+                        )
+                    except ValueError:
+                        errors.append(
+                            BulkItemError(
+                                task_id=tid,
+                                error_code="INVALID_UUID",
+                                detail="Provided assignee_id is not a valid UUID.",
+                            )
+                        )
+                        continue
+                else:
+                    task.assignee_id = None
+                successful_ids.append(tid)
+
+            elif op == "update_priority":
+                new_pri = payload.get("priority")
+                if not new_pri:
+                    errors.append(
+                        BulkItemError(
+                            task_id=tid,
+                            error_code="INVALID_PAYLOAD",
+                            detail="Missing 'priority' in payload.",
+                        )
+                    )
+                    continue
+                old_pri = task.priority
+                task.priority = new_pri
+                await self.work_item_repo.record_activity(
+                    task.id, actor_id, "priority", old_pri, new_pri
+                )
+                successful_ids.append(tid)
+
+            elif op == "add_label":
+                lid_raw = payload.get("label_id")
+                if not lid_raw:
+                    errors.append(
+                        BulkItemError(
+                            task_id=tid,
+                            error_code="INVALID_PAYLOAD",
+                            detail="Missing 'label_id' in payload.",
+                        )
+                    )
+                    continue
+                try:
+                    label_id = uuid.UUID(str(lid_raw))
+                    label_obj = await self.work_item_repo.get_label_by_id(
+                        label_id, org_id
+                    )
+                    if label_obj is None:
+                        errors.append(
+                            BulkItemError(
+                                task_id=tid,
+                                error_code="LABEL_NOT_FOUND",
+                                detail="Label not found in organization.",
+                            )
+                        )
+                        continue
+                    await self.work_item_repo.add_label_to_item(task.id, label_id)
+                    successful_ids.append(tid)
+                except ValueError:
+                    errors.append(
+                        BulkItemError(
+                            task_id=tid,
+                            error_code="INVALID_UUID",
+                            detail="Provided label_id is not a valid UUID.",
+                        )
+                    )
+                    continue
+
+            elif op == "delete":
+                await self.work_item_repo.delete_work_item(task)
+                successful_ids.append(tid)
+
+        await self.session.commit()
+
+        return BulkTaskOperationResponse(
+            total_requested=len(request.task_ids),
+            successful_count=len(successful_ids),
+            failed_count=len(errors),
+            errors=errors,
+            affected_task_ids=successful_ids,
+        )
+
 
 class SavedFilterService:
     """Service managing persistent saved filters and views."""
@@ -2652,9 +3909,7 @@ class SavedFilterService:
                     status_code=status.HTTP_404_NOT_FOUND,
                 )
 
-        filter_dict = request.filter_criteria.model_dump(
-            mode="json", exclude_none=True
-        )
+        filter_dict = request.filter_criteria.model_dump(mode="json", exclude_none=True)
 
         saved_filter = SavedFilter(
             user_id=user_id,
@@ -2778,4 +4033,3 @@ class SavedFilterService:
             page_size=page_size,
             accessible_filter=accessible_filter,
         )
-

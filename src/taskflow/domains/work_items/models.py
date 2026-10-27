@@ -541,9 +541,7 @@ class SavedFilter(Base, UUIDMixin, TimestampMixin):
         nullable=False,
     )
 
-    __table_args__ = (
-        Index("ix_saved_filters_org_user", "organization_id", "user_id"),
-    )
+    __table_args__ = (Index("ix_saved_filters_org_user", "organization_id", "user_id"),)
 
     user: Mapped["User"] = relationship("User")
     organization: Mapped["Organization | None"] = relationship("Organization")
@@ -655,3 +653,305 @@ class TaskDependency(Base, UUIDMixin):
     )
 
 
+class TaskTemplate(Base, UUIDMixin, TimestampMixin):
+    """Reusable blueprint for creating standardized work items."""
+
+    __tablename__ = "task_templates"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    task_title: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    task_description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    task_type: Mapped[str] = mapped_column(
+        String(50),
+        default="task",
+        nullable=False,
+    )
+    priority: Mapped[str] = mapped_column(
+        String(50),
+        default="medium",
+        nullable=False,
+    )
+    estimated_points: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    checklist_definitions: Mapped[list[dict] | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    default_assignee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "name",
+            name="uq_task_templates_project_name",
+        ),
+    )
+
+    project: Mapped["Project"] = relationship("Project")
+    organization: Mapped["Organization"] = relationship("Organization")
+    default_assignee: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[default_assignee_id],
+    )
+    created_by: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[created_by_id],
+    )
+
+
+class RecurringTaskRule(Base, UUIDMixin, TimestampMixin):
+    """Rule defining recurring task generation on a schedule."""
+
+    __tablename__ = "recurring_task_rules"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    type: Mapped[str] = mapped_column(
+        String(50),
+        default="task",
+        nullable=False,
+    )
+    priority: Mapped[str] = mapped_column(
+        String(50),
+        default="medium",
+        nullable=False,
+    )
+    estimated_points: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    assignee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    recurrence_pattern: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
+    interval_value: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        nullable=False,
+    )
+    timezone: Mapped[str] = mapped_column(
+        String(50),
+        default="UTC",
+        nullable=False,
+    )
+    next_run_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        nullable=False,
+        index=True,
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    project: Mapped["Project"] = relationship("Project")
+    organization: Mapped["Organization"] = relationship("Organization")
+    assignee: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[assignee_id],
+    )
+    created_by: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[created_by_id],
+    )
+
+
+class AutomationRule(Base, UUIDMixin, TimestampMixin):
+    """Configurable project event automation rule."""
+
+    __tablename__ = "automation_rules"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    trigger_event: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        index=True,
+    )
+    trigger_conditions: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    action_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    action_payload: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        nullable=False,
+        index=True,
+    )
+    execution_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    last_executed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    project: Mapped["Project"] = relationship("Project")
+    organization: Mapped["Organization"] = relationship("Organization")
+    created_by: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[created_by_id],
+    )
+    logs: Mapped[list["AutomationLog"]] = relationship(
+        "AutomationLog",
+        back_populates="rule",
+        cascade="all, delete-orphan",
+    )
+
+
+class AutomationLog(Base, UUIDMixin):
+    """Audit log recording automation rule execution outcome."""
+
+    __tablename__ = "automation_logs"
+
+    rule_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("automation_rules.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    work_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("work_items.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    trigger_event: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
+    action_taken: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    details: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    executed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+        index=True,
+    )
+
+    rule: Mapped["AutomationRule"] = relationship(
+        "AutomationRule",
+        back_populates="logs",
+    )
+    project: Mapped["Project"] = relationship("Project")
+    work_item: Mapped["WorkItem | None"] = relationship("WorkItem")

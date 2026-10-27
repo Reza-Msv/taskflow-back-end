@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -572,9 +573,7 @@ class MilestoneBrief(BaseModel):
 
     id: uuid.UUID = Field(..., description="Unique milestone identifier")
     name: str = Field(..., description="Milestone title")
-    target_date: datetime = Field(
-        ..., description="Target completion timestamp (UTC)"
-    )
+    target_date: datetime = Field(..., description="Target completion timestamp (UTC)")
     is_completed: bool = Field(False, description="Completion status")
 
 
@@ -633,12 +632,8 @@ class MilestoneResponse(BaseModel):
     id: uuid.UUID = Field(..., description="Unique milestone identifier")
     project_id: uuid.UUID = Field(..., description="Associated project ID")
     name: str = Field(..., description="Milestone name")
-    description: str | None = Field(
-        default=None, description="Milestone description"
-    )
-    target_date: datetime = Field(
-        ..., description="Target completion timestamp (UTC)"
-    )
+    description: str | None = Field(default=None, description="Milestone description")
+    target_date: datetime = Field(..., description="Target completion timestamp (UTC)")
     is_completed: bool = Field(..., description="Whether milestone is completed")
     total_tasks: int = Field(
         default=0, description="Total tasks attached to this milestone"
@@ -689,18 +684,14 @@ class TaskDependencyResponse(BaseModel):
     project_id: uuid.UUID = Field(..., description="Associated project ID")
     predecessor_id: uuid.UUID = Field(..., description="Predecessor task ID")
     successor_id: uuid.UUID = Field(..., description="Successor task ID")
-    dependency_type: str = Field(
-        ..., description="Dependency relationship type"
-    )
+    dependency_type: str = Field(..., description="Dependency relationship type")
     created_at: datetime = Field(..., description="Creation timestamp (UTC)")
 
 
 class TaskDependencyListResponse(BaseModel):
     """List of project dependencies."""
 
-    items: list[TaskDependencyResponse] = Field(
-        ..., description="Dependencies"
-    )
+    items: list[TaskDependencyResponse] = Field(..., description="Dependencies")
     total: int = Field(..., description="Total dependencies count")
 
 
@@ -744,18 +735,12 @@ class WorkItemDetailResponse(WorkItemResponse):
     attachments: list[AttachmentResponse] = Field(
         default_factory=list, description="Attached files"
     )
-    subtasks_count: int = Field(
-        default=0, description="Total child subtasks count"
-    )
-    checklists_count: int = Field(
-        default=0, description="Total checklist items count"
-    )
+    subtasks_count: int = Field(default=0, description="Total child subtasks count")
+    checklists_count: int = Field(default=0, description="Total checklist items count")
     completed_checklists_count: int = Field(
         default=0, description="Completed checklist items count"
     )
-    attachments_count: int = Field(
-        default=0, description="Total attachments count"
-    )
+    attachments_count: int = Field(default=0, description="Total attachments count")
     comments_count: int = Field(default=0, description="Total comments count")
 
 
@@ -957,12 +942,8 @@ class CalendarResponse(BaseModel):
         description="Tasks in project without planned start or due date",
     )
     total: int = Field(..., description="Total scheduled tasks in requested range")
-    start_date: datetime = Field(
-        ..., description="Query range start timestamp (UTC)"
-    )
-    end_date: datetime = Field(
-        ..., description="Query range end timestamp (UTC)"
-    )
+    start_date: datetime = Field(..., description="Query range start timestamp (UTC)")
+    end_date: datetime = Field(..., description="Query range end timestamp (UTC)")
 
 
 class TimelineTaskItem(BaseModel):
@@ -1007,12 +988,8 @@ class TimelineMilestoneItem(BaseModel):
 
     id: uuid.UUID = Field(..., description="Milestone identifier")
     name: str = Field(..., description="Milestone name")
-    description: str | None = Field(
-        default=None, description="Milestone description"
-    )
-    target_date: datetime = Field(
-        ..., description="Target completion timestamp (UTC)"
-    )
+    description: str | None = Field(default=None, description="Milestone description")
+    target_date: datetime = Field(..., description="Target completion timestamp (UTC)")
     is_completed: bool = Field(..., description="Whether milestone is completed")
 
 
@@ -1050,3 +1027,583 @@ class TimelineResponse(BaseModel):
     )
 
 
+# -------------------------------------------------------------
+# Phase 11: Advanced Project Management Schemas
+# -------------------------------------------------------------
+
+
+class WorkflowStatusCreateRequest(BaseModel):
+    """Payload to create a custom project workflow status."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Display name for workflow status",
+    )
+    category: str = Field(
+        default="todo",
+        pattern="^(todo|in_progress|done|cancelled)$",
+        description="Category: todo, in_progress, done, cancelled",
+    )
+    position: int = Field(
+        default=0,
+        ge=0,
+        description="Column order position",
+    )
+    is_default: bool = Field(
+        default=False,
+        description="Whether this is the default starting status",
+    )
+
+
+class WorkflowStatusUpdateRequest(BaseModel):
+    """Payload to update an existing workflow status."""
+
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Updated display name",
+    )
+    category: str | None = Field(
+        default=None,
+        pattern="^(todo|in_progress|done|cancelled)$",
+        description="Updated category",
+    )
+    position: int | None = Field(
+        default=None,
+        ge=0,
+        description="Updated position",
+    )
+    is_default: bool | None = Field(
+        default=None,
+        description="Updated default status flag",
+    )
+
+
+class WorkflowTransitionCreateRequest(BaseModel):
+    """Payload to define an allowed transition between statuses."""
+
+    from_status_id: uuid.UUID = Field(
+        ...,
+        description="Source status ID",
+    )
+    to_status_id: uuid.UUID = Field(
+        ...,
+        description="Destination status ID",
+    )
+    name: str | None = Field(
+        default=None,
+        max_length=100,
+        description="Optional transition name (e.g. 'Start Review')",
+    )
+
+    @model_validator(mode="after")
+    def validate_different_statuses(self) -> "WorkflowTransitionCreateRequest":
+        if self.from_status_id == self.to_status_id:
+            raise ValueError("from_status_id and to_status_id must be different")
+        return self
+
+
+class WorkflowTransitionResponse(BaseModel):
+    """Allowed transition between two workflow statuses."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Transition ID")
+    from_status_id: uuid.UUID = Field(..., description="Source status ID")
+    to_status_id: uuid.UUID = Field(..., description="Destination status ID")
+    name: str | None = Field(default=None, description="Transition name")
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+
+
+class WorkflowStatusDetailResponse(BaseModel):
+    """Detailed workflow status including allowed outgoing transitions."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique status ID")
+    project_id: uuid.UUID | None = Field(
+        default=None,
+        description="Associated project ID (null for system defaults)",
+    )
+    name: str = Field(..., description="Status display name")
+    category: str = Field(..., description="Status category")
+    position: int = Field(..., description="Column display position")
+    is_default: bool = Field(..., description="Whether status is default")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last updated timestamp")
+    allowed_transitions: list[WorkflowTransitionResponse] = Field(
+        default_factory=list,
+        description="Allowed outgoing transitions from this status",
+    )
+
+
+class WorkflowStatusListResponse(BaseModel):
+    """List of workflow statuses for a project."""
+
+    items: list[WorkflowStatusDetailResponse] = Field(..., description="Statuses")
+    total: int = Field(..., description="Total statuses count")
+
+
+class WorkflowTransitionListResponse(BaseModel):
+    """List of allowed transitions for a project."""
+
+    items: list[WorkflowTransitionResponse] = Field(..., description="Transitions")
+    total: int = Field(..., description="Total transitions count")
+
+
+class TaskTemplateCreateRequest(BaseModel):
+    """Payload to create a reusable task blueprint."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Template identifier name",
+        examples=["Security Review Checklist"],
+    )
+    description: str | None = Field(
+        default=None,
+        description="Description of what this template is for",
+    )
+    task_title: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Default title for tasks created from this template",
+    )
+    task_description: str | None = Field(
+        default=None,
+        description="Default markdown description for instantiated tasks",
+    )
+    task_type: str = Field(
+        default="task",
+        description="Task type: task, bug, story, epic",
+    )
+    priority: str = Field(
+        default="medium",
+        description="Default priority: lowest, low, medium, high, urgent",
+    )
+    estimated_points: int | None = Field(
+        default=None,
+        ge=0,
+        description="Default story point estimation",
+    )
+    checklist_definitions: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="List of checklist item titles or configs to clone",
+    )
+    default_assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional pre-assigned user ID",
+    )
+
+
+class TaskTemplateUpdateRequest(BaseModel):
+    """Payload to update an existing task template."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None)
+    task_title: str | None = Field(default=None, min_length=1, max_length=255)
+    task_description: str | None = Field(default=None)
+    task_type: str | None = Field(default=None)
+    priority: str | None = Field(default=None)
+    estimated_points: int | None = Field(default=None, ge=0)
+    checklist_definitions: list[dict[str, Any]] | None = Field(default=None)
+    default_assignee_id: uuid.UUID | None = Field(default=None)
+
+
+class TaskTemplateResponse(BaseModel):
+    """Full task template entity representation."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique template identifier")
+    project_id: uuid.UUID = Field(..., description="Associated project ID")
+    organization_id: uuid.UUID = Field(
+        ...,
+        description="Associated organization ID",
+    )
+    name: str = Field(..., description="Template name")
+    description: str | None = Field(default=None, description="Template description")
+    task_title: str = Field(..., description="Default task title")
+    task_description: str | None = Field(
+        default=None,
+        description="Default task description",
+    )
+    task_type: str = Field(..., description="Default task type")
+    priority: str = Field(..., description="Default priority")
+    estimated_points: int | None = Field(
+        default=None,
+        description="Story point estimate",
+    )
+    checklist_definitions: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Checklist items blueprint",
+    )
+    default_assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Default assignee ID",
+    )
+    created_by_id: uuid.UUID | None = Field(
+        default=None,
+        description="Creator user ID",
+    )
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    updated_at: datetime = Field(..., description="Last updated timestamp (UTC)")
+
+
+class TaskTemplateListResponse(BaseModel):
+    """List of project task templates."""
+
+    items: list[TaskTemplateResponse] = Field(..., description="Templates")
+    total: int = Field(..., description="Total templates count")
+
+
+class InstantiateTemplateRequest(BaseModel):
+    """Payload to instantiate a work item from a template."""
+
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="Override task title (defaults to template task_title)",
+    )
+    assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Override assignee ID (defaults to template default_assignee_id)",
+    )
+    sprint_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional sprint to place the new task into",
+    )
+    due_date: datetime | None = Field(
+        default=None,
+        description="Optional due date for the new task",
+    )
+
+
+class RecurringTaskRuleCreateRequest(BaseModel):
+    """Payload to create a recurring task generator rule."""
+
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Title for spawned tasks",
+    )
+    description: str | None = Field(
+        default=None,
+        description="Description for spawned tasks",
+    )
+    type: str = Field(
+        default="task",
+        description="Task type: task, bug, story",
+    )
+    priority: str = Field(
+        default="medium",
+        description="Priority: lowest, low, medium, high, urgent",
+    )
+    estimated_points: int | None = Field(
+        default=None,
+        ge=0,
+        description="Story point estimate",
+    )
+    assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Assignee ID for spawned tasks",
+    )
+    recurrence_pattern: str = Field(
+        ...,
+        pattern="^(daily|weekly|monthly|custom)$",
+        description="Recurrence frequency: daily, weekly, monthly, custom",
+    )
+    interval_value: int = Field(
+        default=1,
+        ge=1,
+        description="Recurrence interval count (e.g. every 2 weeks)",
+    )
+    timezone: str = Field(
+        default="UTC",
+        description="Timezone string for evaluation",
+    )
+    next_run_at: datetime | None = Field(
+        default=None,
+        description="First scheduled run timestamp (UTC, defaults to now)",
+    )
+    is_active: bool = Field(
+        default=True,
+        description="Whether the recurring rule is currently active",
+    )
+
+
+class RecurringTaskRuleUpdateRequest(BaseModel):
+    """Payload to update an existing recurring task rule."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None)
+    type: str | None = Field(default=None)
+    priority: str | None = Field(default=None)
+    estimated_points: int | None = Field(default=None, ge=0)
+    assignee_id: uuid.UUID | None = Field(default=None)
+    recurrence_pattern: str | None = Field(
+        default=None,
+        pattern="^(daily|weekly|monthly|custom)$",
+    )
+    interval_value: int | None = Field(default=None, ge=1)
+    timezone: str | None = Field(default=None)
+    next_run_at: datetime | None = Field(default=None)
+    is_active: bool | None = Field(default=None)
+
+
+class RecurringTaskRuleResponse(BaseModel):
+    """Recurring task rule entity representation."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Rule identifier")
+    project_id: uuid.UUID = Field(..., description="Associated project ID")
+    organization_id: uuid.UUID = Field(
+        ...,
+        description="Associated organization ID",
+    )
+    title: str = Field(..., description="Task title")
+    description: str | None = Field(default=None, description="Task description")
+    type: str = Field(..., description="Task type")
+    priority: str = Field(..., description="Task priority")
+    estimated_points: int | None = Field(
+        default=None,
+        description="Story point estimate",
+    )
+    assignee_id: uuid.UUID | None = Field(
+        default=None,
+        description="Assigned user ID",
+    )
+    recurrence_pattern: str = Field(..., description="Recurrence pattern")
+    interval_value: int = Field(..., description="Recurrence interval")
+    timezone: str = Field(..., description="Timezone")
+    next_run_at: datetime = Field(..., description="Next execution timestamp (UTC)")
+    last_run_at: datetime | None = Field(
+        default=None,
+        description="Last execution timestamp (UTC)",
+    )
+    is_active: bool = Field(..., description="Active flag")
+    created_by_id: uuid.UUID | None = Field(
+        default=None,
+        description="Creator user ID",
+    )
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    updated_at: datetime = Field(..., description="Last updated timestamp (UTC)")
+
+
+class RecurringTaskRuleListResponse(BaseModel):
+    """List of recurring task rules for a project."""
+
+    items: list[RecurringTaskRuleResponse] = Field(..., description="Rules")
+    total: int = Field(..., description="Total recurring rules count")
+
+
+class TriggerRecurrenceResponse(BaseModel):
+    """Outcome of manually or automatically triggering a recurring rule."""
+
+    task: WorkItemResponse = Field(..., description="Newly created task")
+    rule: RecurringTaskRuleResponse = Field(..., description="Updated rule")
+    message: str = Field(..., description="Status message")
+
+
+class AutomationRuleCreateRequest(BaseModel):
+    """Payload to create an event-driven automation rule."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Descriptive name of rule",
+        examples=["Auto-assign bugs to QA lead"],
+    )
+    description: str | None = Field(
+        default=None,
+        description="Rule explanation",
+    )
+    trigger_event: str = Field(
+        ...,
+        pattern="^(task_created|task_status_changed|task_assigned|task_completed)$",
+        description="Triggering event",
+    )
+    trigger_conditions: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional filter criteria (e.g. {'status': 'done'})",
+    )
+    action_type: str = Field(
+        ...,
+        pattern="^(assign_user|change_status|update_priority|send_notification)$",
+        description="Action to execute",
+    )
+    action_payload: dict[str, Any] = Field(
+        ...,
+        description="Action configuration payload (e.g. {'user_id': '...'})",
+    )
+    is_active: bool = Field(
+        default=True,
+        description="Whether the rule is enabled",
+    )
+
+
+class AutomationRuleUpdateRequest(BaseModel):
+    """Payload to update an existing automation rule."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None)
+    trigger_event: str | None = Field(
+        default=None,
+        pattern="^(task_created|task_status_changed|task_assigned|task_completed)$",
+    )
+    trigger_conditions: dict[str, Any] | None = Field(default=None)
+    action_type: str | None = Field(
+        default=None,
+        pattern="^(assign_user|change_status|update_priority|send_notification)$",
+    )
+    action_payload: dict[str, Any] | None = Field(default=None)
+    is_active: bool | None = Field(default=None)
+
+
+class AutomationRuleResponse(BaseModel):
+    """Automation rule entity representation."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Rule identifier")
+    project_id: uuid.UUID = Field(..., description="Associated project ID")
+    organization_id: uuid.UUID = Field(
+        ...,
+        description="Associated organization ID",
+    )
+    name: str = Field(..., description="Rule name")
+    description: str | None = Field(default=None, description="Description")
+    trigger_event: str = Field(..., description="Trigger event name")
+    trigger_conditions: dict[str, Any] | None = Field(
+        default=None,
+        description="Filter conditions",
+    )
+    action_type: str = Field(..., description="Action type")
+    action_payload: dict[str, Any] = Field(..., description="Action payload")
+    is_active: bool = Field(..., description="Active flag")
+    execution_count: int = Field(default=0, description="Times rule fired")
+    last_executed_at: datetime | None = Field(
+        default=None,
+        description="Last executed timestamp (UTC)",
+    )
+    created_by_id: uuid.UUID | None = Field(
+        default=None,
+        description="Creator user ID",
+    )
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    updated_at: datetime = Field(..., description="Last updated timestamp (UTC)")
+
+
+class AutomationRuleListResponse(BaseModel):
+    """List of automation rules for a project."""
+
+    items: list[AutomationRuleResponse] = Field(..., description="Automation rules")
+    total: int = Field(..., description="Total rules count")
+
+
+class AutomationLogResponse(BaseModel):
+    """Audit entry for an executed automation rule."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Log entry ID")
+    rule_id: uuid.UUID = Field(..., description="Automation rule ID")
+    project_id: uuid.UUID = Field(..., description="Associated project ID")
+    work_item_id: uuid.UUID | None = Field(
+        default=None,
+        description="Associated work item ID",
+    )
+    trigger_event: str = Field(..., description="Trigger event")
+    status: str = Field(..., description="Execution status: success, skipped, failed")
+    action_taken: str = Field(..., description="Description of action taken")
+    error_message: str | None = Field(default=None, description="Error details if any")
+    details: dict[str, Any] | None = Field(
+        default=None,
+        description="Execution metadata and diff",
+    )
+    executed_at: datetime = Field(..., description="Execution timestamp (UTC)")
+
+
+class AutomationLogListResponse(BaseModel):
+    """List of automation execution logs."""
+
+    items: list[AutomationLogResponse] = Field(..., description="Logs")
+    total: int = Field(..., description="Total log count")
+
+
+class AutomationDryRunRequest(BaseModel):
+    """Payload to test an automation rule against a task without saving changes."""
+
+    work_item_id: uuid.UUID = Field(..., description="Target task to test against")
+
+
+class AutomationDryRunResponse(BaseModel):
+    """Simulated result of executing an automation rule."""
+
+    matched: bool = Field(
+        ...,
+        description="Whether trigger conditions matched target task",
+    )
+    action_type: str = Field(..., description="Configured action type")
+    projected_action: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Projected changes that would be applied",
+    )
+    reason: str = Field(..., description="Explanation of match evaluation")
+
+
+class BulkTaskOperationRequest(BaseModel):
+    """Payload to execute a batch operation across multiple tasks."""
+
+    task_ids: list[uuid.UUID] = Field(
+        ...,
+        min_length=1,
+        description="List of task IDs to modify (bounded by MAX_BULK_UPDATE_LIMIT)",
+    )
+    operation: str = Field(
+        ...,
+        pattern="^(update_status|assign_user|update_priority|add_label|delete)$",
+        description=(
+            "Operation: update_status, assign_user, update_priority, add_label, delete"
+        ),
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Operation parameters (e.g. {'status': 'done'})",
+    )
+
+
+class BulkItemError(BaseModel):
+    """Structured failure for an individual item in a bulk operation."""
+
+    task_id: uuid.UUID = Field(..., description="Task identifier that failed")
+    error_code: str = Field(..., description="Machine-readable error code")
+    detail: str = Field(..., description="Human-readable reason for failure")
+
+
+class BulkTaskOperationResponse(BaseModel):
+    """Summary of bulk operation execution."""
+
+    total_requested: int = Field(..., description="Total tasks submitted")
+    successful_count: int = Field(
+        ...,
+        description="Count of successfully modified tasks",
+    )
+    failed_count: int = Field(..., description="Count of failed tasks")
+    errors: list[BulkItemError] = Field(
+        default_factory=list,
+        description="Details for failed items",
+    )
+    affected_task_ids: list[uuid.UUID] = Field(
+        default_factory=list,
+        description="List of task IDs that succeeded",
+    )
