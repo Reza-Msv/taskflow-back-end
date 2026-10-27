@@ -17,7 +17,6 @@ class NotificationBroadcaster(Protocol):
         """Register active WebSocket for a user."""
         ...
 
-
     async def disconnect(self, user_id: uuid.UUID, websocket: WebSocket) -> None:
         """Unregister active WebSocket for a user."""
         ...
@@ -135,20 +134,23 @@ class InMemoryConnectionManager:
             "timestamp": timestamp,
         }
 
-        sent_count = 0
-        dead_sockets: list[WebSocket] = []
-
-        for ws in sockets:
+        async def _send(ws: WebSocket) -> WebSocket | None:
             try:
                 await ws.send_json(message)
-                sent_count += 1
+                return None
             except Exception as exc:
                 logger.debug(
                     "Failed to deliver WebSocket message to socket for user %s: %s",
                     user_id,
                     exc,
                 )
-                dead_sockets.append(ws)
+                return ws
+
+        results = await asyncio.gather(
+            *[_send(ws) for ws in sockets], return_exceptions=False
+        )
+        dead_sockets = [ws for ws in results if ws is not None]
+        sent_count = len(sockets) - len(dead_sockets)
 
         if dead_sockets:
             async with self._lock:
@@ -165,18 +167,20 @@ class InMemoryConnectionManager:
 
         return sent_count
 
-
     async def broadcast_to_users(
         self,
         user_ids: Iterable[uuid.UUID],
         event: str,
         payload: dict[str, Any],
     ) -> int:
-        """Broadcast payload to multiple distinct users."""
-        total_delivered = 0
-        for uid in set(user_ids):
-            total_delivered += await self.broadcast_to_user(uid, event, payload)
-        return total_delivered
+        """Broadcast payload to multiple distinct users concurrently."""
+        unique_uids = list(set(user_ids))
+        if not unique_uids:
+            return 0
+        results = await asyncio.gather(
+            *[self.broadcast_to_user(uid, event, payload) for uid in unique_uids]
+        )
+        return sum(results)
 
     def is_user_connected(self, user_id: uuid.UUID) -> bool:
         """Check if user has at least one active connection."""

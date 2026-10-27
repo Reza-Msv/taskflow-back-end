@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -561,6 +562,26 @@ class WorkItemRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_ids(
+        self, task_ids: Sequence[uuid.UUID], project_id: uuid.UUID | None = None
+    ) -> list[WorkItem]:
+        """Fetch multiple work items by ID in a single query."""
+        if not task_ids:
+            return []
+        stmt = (
+            select(WorkItem)
+            .options(
+                selectinload(WorkItem.project),
+                selectinload(WorkItem.assignee),
+                selectinload(WorkItem.reporter),
+            )
+            .where(WorkItem.id.in_(task_ids))
+        )
+        if project_id is not None:
+            stmt = stmt.where(WorkItem.project_id == project_id)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_next_sequence_and_issue_key(
         self, project_id: uuid.UUID, project_key: str
     ) -> tuple[int, str]:
@@ -812,9 +833,12 @@ class WorkItemRepository:
         return list(res.scalars().all()), total
 
     async def list_all_project_work_items(
-        self, project_id: uuid.UUID
+        self, project_id: uuid.UUID, limit: int | None = 1000
     ) -> list[WorkItem]:
-        """List all work items for a project (e.g. for Kanban board)."""
+        """
+        List all work items for a project (e.g. for Kanban board),
+        bounded by safety limit.
+        """
         stmt = (
             select(WorkItem)
             .options(
@@ -824,6 +848,8 @@ class WorkItemRepository:
             .where(WorkItem.project_id == project_id)
             .order_by(WorkItem.rank.asc(), WorkItem.created_at.asc())
         )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         res = await self.session.execute(stmt)
         return list(res.scalars().all())
 
@@ -1528,6 +1554,7 @@ class WorkItemRepository:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         include_unscheduled: bool = True,
+        limit: int | None = 1000,
     ) -> tuple[list[WorkItem], list[Milestone], list[TaskDependency]]:
         """Batch fetch tasks, milestones, and dependencies for Timeline/Gantt view."""
         conditions = [WorkItem.project_id == project_id]
@@ -1569,6 +1596,8 @@ class WorkItemRepository:
                 WorkItem.rank.asc(),
             )
         )
+        if limit is not None:
+            task_stmt = task_stmt.limit(limit)
         task_res = await self.session.execute(task_stmt)
         tasks = list(task_res.scalars().all())
 

@@ -1423,24 +1423,27 @@ class TaskService:
         tasks = await self.work_item_repo.list_all_project_work_items(project_id)
 
         # Group tasks by matching status name or category
-        columns: list[KanbanColumn] = []
         task_dtos = [WorkItemResponse.model_validate(t) for t in tasks]
+        status_matchers = [
+            (st.name.lower().replace(" ", "_"), st.category.lower()) for st in statuses
+        ]
+        columns_tasks: list[list[WorkItemResponse]] = [[] for _ in statuses]
 
-        for st in statuses:
-            st_key = st.name.lower().replace(" ", "_")
-            col_tasks = [
-                t
-                for t in task_dtos
-                if t.status.lower().replace(" ", "_") == st_key
-                or t.status.lower() == st.category.lower()
-            ]
-            columns.append(
-                KanbanColumn(
-                    status=WorkflowStatusResponse.model_validate(st),
-                    tasks=col_tasks,
-                    total_tasks=len(col_tasks),
-                )
+        for t in task_dtos:
+            t_status_norm = t.status.lower().replace(" ", "_")
+            t_status_raw = t.status.lower()
+            for idx, (st_key, cat_key) in enumerate(status_matchers):
+                if t_status_norm == st_key or t_status_raw == cat_key:
+                    columns_tasks[idx].append(t)
+
+        columns = [
+            KanbanColumn(
+                status=WorkflowStatusResponse.model_validate(st),
+                tasks=col_tasks,
+                total_tasks=len(col_tasks),
             )
+            for st, col_tasks in zip(statuses, columns_tasks, strict=False)
+        ]
 
         return KanbanBoardResponse(
             project_id=project_id,
@@ -3653,13 +3656,107 @@ class TaskService:
         successful_ids: list[uuid.UUID] = []
         errors: list[BulkItemError] = []
 
+        # Batch fetch all candidate tasks in one query
+        fetched_tasks = await self.work_item_repo.get_by_ids(
+            request.task_ids, project_id=project_id
+        )
+        task_map = {t.id: t for t in fetched_tasks if t.organization_id == org_id}
+
+        op = request.operation
+        payload = request.payload
+
+        # Hoist common validations and lookups outside the per-task loop
+        target_st_obj = None
+        new_st: str | None = None
+        is_completed_target = False
+        has_trans = False
+        status_cache: dict[str, Any] = {}
+        transitions_cache: dict[uuid.UUID, set[uuid.UUID]] = {}
+        payload_error_code: str | None = None
+        payload_error_detail: str | None = None
+        validated_assignee_id: uuid.UUID | None = None
+        clear_assignee = False
+        validated_label_id: uuid.UUID | None = None
+
+        if op == "update_status":
+            target_status_name = payload.get("status")
+            if not target_status_name:
+                payload_error_code = "INVALID_PAYLOAD"
+                payload_error_detail = "Missing 'status' in payload."
+            else:
+                target_st_obj = await self.work_item_repo.get_status_by_name_or_id(
+                    project_id, target_status_name
+                )
+                if target_st_obj is None:
+                    payload_error_code = "INVALID_STATUS"
+                    payload_error_detail = (
+                        f"Status '{target_status_name}' is not recognized."
+                    )
+                else:
+                    st_name_lower = target_st_obj.name.lower()
+                    if st_name_lower in ("to do", "todo"):
+                        new_st = "todo"
+                    elif st_name_lower in ("in progress", "in_progress"):
+                        new_st = "in_progress"
+                    elif st_name_lower in ("done",):
+                        new_st = "done"
+                    else:
+                        new_st = target_st_obj.name
+
+                    is_completed_target = new_st in COMPLETED_STATUSES or bool(
+                        target_st_obj.category
+                        and target_st_obj.category.lower() in COMPLETED_STATUSES
+                    )
+                    has_trans = await self.work_item_repo.has_configured_transitions(
+                        project_id
+                    )
+
+        elif op == "assign_user":
+            target_uid_raw = payload.get("assignee_id")
+            if target_uid_raw is not None:
+                try:
+                    user_uuid = uuid.UUID(str(target_uid_raw))
+                    mem = await self.org_repo.get_membership(org_id, user_uuid)
+                    if mem is None or not mem.is_active:
+                        payload_error_code = "INVALID_ASSIGNEE"
+                        payload_error_detail = "Assignee is not an active member."
+                    else:
+                        validated_assignee_id = user_uuid
+                except ValueError:
+                    payload_error_code = "INVALID_UUID"
+                    payload_error_detail = "Provided assignee_id is not a valid UUID."
+            else:
+                clear_assignee = True
+
+        elif op == "update_priority":
+            new_pri = payload.get("priority")
+            if not new_pri:
+                payload_error_code = "INVALID_PAYLOAD"
+                payload_error_detail = "Missing 'priority' in payload."
+
+        elif op == "add_label":
+            lid_raw = payload.get("label_id")
+            if not lid_raw:
+                payload_error_code = "INVALID_PAYLOAD"
+                payload_error_detail = "Missing 'label_id' in payload."
+            else:
+                try:
+                    label_id = uuid.UUID(str(lid_raw))
+                    label_obj = await self.work_item_repo.get_label_by_id(
+                        label_id, org_id
+                    )
+                    if label_obj is None:
+                        payload_error_code = "LABEL_NOT_FOUND"
+                        payload_error_detail = "Label not found in organization."
+                    else:
+                        validated_label_id = label_id
+                except ValueError:
+                    payload_error_code = "INVALID_UUID"
+                    payload_error_detail = "Provided label_id is not a valid UUID."
+
         for tid in request.task_ids:
-            task = await self.work_item_repo.get_by_id(tid)
-            if (
-                task is None
-                or task.project_id != project_id
-                or task.organization_id != org_id
-            ):
+            task = task_map.get(tid)
+            if task is None:
                 errors.append(
                     BulkItemError(
                         task_id=tid,
@@ -3669,51 +3766,19 @@ class TaskService:
                 )
                 continue
 
-            op = request.operation
-            payload = request.payload
+            if payload_error_code:
+                errors.append(
+                    BulkItemError(
+                        task_id=tid,
+                        error_code=payload_error_code,
+                        detail=payload_error_detail or "",
+                    )
+                )
+                continue
 
             if op == "update_status":
-                target_status_name = payload.get("status")
-                if not target_status_name:
-                    errors.append(
-                        BulkItemError(
-                            task_id=tid,
-                            error_code="INVALID_PAYLOAD",
-                            detail="Missing 'status' in payload.",
-                        )
-                    )
-                    continue
-
-                target_st_obj = await self.work_item_repo.get_status_by_name_or_id(
-                    project_id, target_status_name
-                )
-                if target_st_obj is None:
-                    errors.append(
-                        BulkItemError(
-                            task_id=tid,
-                            error_code="INVALID_STATUS",
-                            detail=(
-                                f"Status '{target_status_name}' is not recognized."
-                            ),
-                        )
-                    )
-                    continue
-
-                if target_st_obj.name.lower() in ("to do", "todo"):
-                    new_st = "todo"
-                elif target_st_obj.name.lower() in ("in progress", "in_progress"):
-                    new_st = "in_progress"
-                elif target_st_obj.name.lower() in ("done",):
-                    new_st = "done"
-                else:
-                    new_st = target_st_obj.name
-
-                # Check dependency blocking
-                is_completed = new_st in COMPLETED_STATUSES or (
-                    target_st_obj.category
-                    and target_st_obj.category.lower() in COMPLETED_STATUSES
-                )
-                if is_completed:
+                assert target_st_obj is not None and new_st is not None
+                if is_completed_target:
                     incomplete_preds = (
                         await self.work_item_repo.get_incomplete_predecessors(task.id)
                     )
@@ -3731,21 +3796,26 @@ class TaskService:
                         )
                         continue
 
-                # Check workflow transitions if configured
-                has_trans = await self.work_item_repo.has_configured_transitions(
-                    project_id
-                )
                 if has_trans and new_st != task.status:
-                    curr_st_obj = await self.work_item_repo.get_status_by_name_or_id(
-                        project_id, task.status
-                    )
-                    if curr_st_obj is not None:
-                        allowed_transitions = (
-                            await self.work_item_repo.get_allowed_transitions(
-                                curr_st_obj.id
-                            )
+                    if task.status not in status_cache:
+                        curr_st = await self.work_item_repo.get_status_by_name_or_id(
+                            project_id, task.status
                         )
-                        allowed_to_ids = {t.to_status_id for t in allowed_transitions}
+                        status_cache[task.status] = curr_st
+                    else:
+                        curr_st = status_cache[task.status]
+
+                    if curr_st is not None:
+                        if curr_st.id not in transitions_cache:
+                            allowed_transitions = (
+                                await self.work_item_repo.get_allowed_transitions(
+                                    curr_st.id
+                                )
+                            )
+                            transitions_cache[curr_st.id] = {
+                                t.to_status_id for t in allowed_transitions
+                            }
+                        allowed_to_ids = transitions_cache[curr_st.id]
                         if target_st_obj.id not in allowed_to_ids:
                             errors.append(
                                 BulkItemError(
@@ -3753,7 +3823,7 @@ class TaskService:
                                     error_code="INVALID_STATUS_TRANSITION",
                                     detail=(
                                         f"Transition from '{task.status}' to "
-                                        f"'{target_status_name}' is not permitted."
+                                        f"'{payload.get('status')}' is not permitted."
                                     ),
                                 )
                             )
@@ -3761,99 +3831,41 @@ class TaskService:
 
                 old_st = task.status
                 task.status = new_st
-                task.completed_at = datetime.now(UTC) if is_completed else None
+                task.completed_at = datetime.now(UTC) if is_completed_target else None
                 await self.work_item_repo.record_activity(
                     task.id, actor_id, "status", old_st, new_st
                 )
                 successful_ids.append(tid)
 
             elif op == "assign_user":
-                target_uid_raw = payload.get("assignee_id")
-                if target_uid_raw is not None:
-                    try:
-                        user_uuid = uuid.UUID(str(target_uid_raw))
-                        mem = await self.org_repo.get_membership(org_id, user_uuid)
-                        if mem is None or not mem.is_active:
-                            errors.append(
-                                BulkItemError(
-                                    task_id=tid,
-                                    error_code="INVALID_ASSIGNEE",
-                                    detail="Assignee is not an active member.",
-                                )
-                            )
-                            continue
-                        old_ass = str(task.assignee_id) if task.assignee_id else None
-                        task.assignee_id = user_uuid
-                        await self.work_item_repo.record_activity(
-                            task.id, actor_id, "assignee_id", old_ass, str(user_uuid)
-                        )
-                    except ValueError:
-                        errors.append(
-                            BulkItemError(
-                                task_id=tid,
-                                error_code="INVALID_UUID",
-                                detail="Provided assignee_id is not a valid UUID.",
-                            )
-                        )
-                        continue
-                else:
+                if clear_assignee:
                     task.assignee_id = None
+                else:
+                    assert validated_assignee_id is not None
+                    old_ass = str(task.assignee_id) if task.assignee_id else None
+                    task.assignee_id = validated_assignee_id
+                    await self.work_item_repo.record_activity(
+                        task.id,
+                        actor_id,
+                        "assignee_id",
+                        old_ass,
+                        str(validated_assignee_id),
+                    )
                 successful_ids.append(tid)
 
             elif op == "update_priority":
-                new_pri = payload.get("priority")
-                if not new_pri:
-                    errors.append(
-                        BulkItemError(
-                            task_id=tid,
-                            error_code="INVALID_PAYLOAD",
-                            detail="Missing 'priority' in payload.",
-                        )
-                    )
-                    continue
+                new_pri_val = str(payload.get("priority"))
                 old_pri = task.priority
-                task.priority = new_pri
+                task.priority = new_pri_val
                 await self.work_item_repo.record_activity(
-                    task.id, actor_id, "priority", old_pri, new_pri
+                    task.id, actor_id, "priority", old_pri, new_pri_val
                 )
                 successful_ids.append(tid)
 
             elif op == "add_label":
-                lid_raw = payload.get("label_id")
-                if not lid_raw:
-                    errors.append(
-                        BulkItemError(
-                            task_id=tid,
-                            error_code="INVALID_PAYLOAD",
-                            detail="Missing 'label_id' in payload.",
-                        )
-                    )
-                    continue
-                try:
-                    label_id = uuid.UUID(str(lid_raw))
-                    label_obj = await self.work_item_repo.get_label_by_id(
-                        label_id, org_id
-                    )
-                    if label_obj is None:
-                        errors.append(
-                            BulkItemError(
-                                task_id=tid,
-                                error_code="LABEL_NOT_FOUND",
-                                detail="Label not found in organization.",
-                            )
-                        )
-                        continue
-                    await self.work_item_repo.add_label_to_item(task.id, label_id)
-                    successful_ids.append(tid)
-                except ValueError:
-                    errors.append(
-                        BulkItemError(
-                            task_id=tid,
-                            error_code="INVALID_UUID",
-                            detail="Provided label_id is not a valid UUID.",
-                        )
-                    )
-                    continue
+                assert validated_label_id is not None
+                await self.work_item_repo.add_label_to_item(task.id, validated_label_id)
+                successful_ids.append(tid)
 
             elif op == "delete":
                 await self.work_item_repo.delete_work_item(task)

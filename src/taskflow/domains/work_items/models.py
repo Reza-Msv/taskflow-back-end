@@ -238,6 +238,7 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
     due_date: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+        index=True,
     )
     start_date: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -278,6 +279,9 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
         ),
         Index("ix_work_items_org_status", "organization_id", "status"),
         Index("ix_work_items_project_completed_at", "project_id", "completed_at"),
+        Index("ix_work_items_project_status", "project_id", "status"),
+        Index("ix_work_items_project_assignee", "project_id", "assignee_id"),
+        Index("ix_work_items_project_due_date", "project_id", "due_date"),
     )
 
     project: Mapped["Project"] = relationship(
@@ -386,6 +390,14 @@ class WorkItemActivity(Base, UUIDMixin):
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
         nullable=False,
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_work_item_activities_item_created",
+            "work_item_id",
+            "created_at",
+        ),
     )
 
     work_item: Mapped["WorkItem"] = relationship(

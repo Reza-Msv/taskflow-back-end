@@ -212,7 +212,6 @@ class CollaborationRepository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all()), total
 
-
     async def get_unread_count(self, user_id: uuid.UUID) -> int:
         """Return total unread notifications for user."""
         stmt = select(func.count(Notification.id)).where(

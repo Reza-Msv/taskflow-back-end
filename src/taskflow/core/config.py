@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     DATABASE_URL: str = (
         "postgresql+asyncpg://taskflow:taskflow_password@localhost:5432/taskflow_db"
     )
+    POSTGRES_POOL_SIZE: int = 20
+    POSTGRES_MAX_OVERFLOW: int = 10
+    POSTGRES_POOL_TIMEOUT: int = 30
+    POSTGRES_POOL_RECYCLE: int = 1800
 
     BACKEND_CORS_ORIGINS: list[str] = [
         "http://localhost:3000",
