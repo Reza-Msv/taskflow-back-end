@@ -250,6 +250,11 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
         nullable=True,
         index=True,
     )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
     estimated_points: Mapped[float | None] = mapped_column(
         Float,
         nullable=True,
@@ -272,6 +277,7 @@ class WorkItem(Base, UUIDMixin, TimestampMixin):
             name="uq_work_items_project_issue_key",
         ),
         Index("ix_work_items_org_status", "organization_id", "status"),
+        Index("ix_work_items_project_completed_at", "project_id", "completed_at"),
     )
 
     project: Mapped["Project"] = relationship(
