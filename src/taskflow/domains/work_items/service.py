@@ -8,6 +8,7 @@ from fastapi import UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from taskflow.core.exceptions import DomainException
+from taskflow.domains.collaboration.models import Notification
 from taskflow.domains.collaboration.repository import CollaborationRepository
 from taskflow.domains.collaboration.websocket import (
     NotificationBroadcaster,
@@ -708,10 +709,12 @@ class TaskService:
                     ),
                     "is_read": assigned_notif.is_read,
                     "created_at": assigned_notif.created_at.isoformat(),
+                    "updated_at": assigned_notif.updated_at.isoformat(),
                 },
             )
 
         return task
+
 
     async def update_task(
         self,
@@ -855,6 +858,7 @@ class TaskService:
             task.parent_id = request.parent_id
             mutated = True
 
+        due_date_notif = None
         if request.due_date is not None and request.due_date != task.due_date:
             await self.work_item_repo.record_activity(
                 task.id,
@@ -865,6 +869,30 @@ class TaskService:
             )
             task.due_date = request.due_date
             mutated = True
+            # Notify assignee if due date changed and not already notified
+            is_already_notified = (
+                assigned_notif is not None
+                and assigned_notif.user_id == task.assignee_id
+            )
+            if (
+                task.assignee_id
+                and task.assignee_id != actor_id
+                and not is_already_notified
+            ):
+                due_str = request.due_date.strftime("%Y-%m-%d")
+                due_date_notif = await self.collab_repo.create_notification(
+                    user_id=task.assignee_id,
+                    actor_id=actor_id,
+                    organization_id=task.organization_id,
+                    type="task_due_date_changed",
+                    title=f"Due Date Changed on {task.issue_key}",
+                    message=(
+                        f"Due date for task {task.issue_key} was updated to {due_str}"
+                    ),
+                    resource_type="task",
+                    resource_id=task.id,
+                )
+
 
         if (
             request.estimated_points is not None
@@ -882,7 +910,11 @@ class TaskService:
             task.estimated_points = request.estimated_points
             mutated = True
 
-        if "sprint_id" in request.model_fields_set and request.sprint_id != task.sprint_id:
+        if (
+            "sprint_id" in request.model_fields_set
+            and request.sprint_id != task.sprint_id
+        ):
+
             old_sprint_val = str(task.sprint_id) if task.sprint_id else None
             new_sprint_val = str(request.sprint_id) if request.sprint_id else None
             await self.work_item_repo.record_activity(
@@ -939,10 +971,44 @@ class TaskService:
                         ),
                         "is_read": assigned_notif.is_read,
                         "created_at": assigned_notif.created_at.isoformat(),
+                        "updated_at": assigned_notif.updated_at.isoformat(),
+                    },
+                )
+
+            if due_date_notif:
+                await self.broadcaster.broadcast_to_user(
+                    due_date_notif.user_id,
+                    "notification_created",
+                    {
+                        "id": str(due_date_notif.id),
+                        "user_id": str(due_date_notif.user_id),
+                        "actor_id": (
+                            str(due_date_notif.actor_id)
+                            if due_date_notif.actor_id
+                            else None
+                        ),
+                        "organization_id": (
+                            str(due_date_notif.organization_id)
+                            if due_date_notif.organization_id
+                            else None
+                        ),
+                        "type": due_date_notif.type,
+                        "title": due_date_notif.title,
+                        "message": due_date_notif.message,
+                        "resource_type": due_date_notif.resource_type,
+                        "resource_id": (
+                            str(due_date_notif.resource_id)
+                            if due_date_notif.resource_id
+                            else None
+                        ),
+                        "is_read": due_date_notif.is_read,
+                        "created_at": due_date_notif.created_at.isoformat(),
+                        "updated_at": due_date_notif.updated_at.isoformat(),
                     },
                 )
 
         return task
+
 
     async def move_task_status(
         self,
@@ -1028,9 +1094,11 @@ class TaskService:
             )
             task.status = new_status_name
 
-            status_notif = None
-            if task.assignee_id and task.assignee_id != actor_id:
-                status_notif = await self.collab_repo.create_notification(
+            status_notifications: list[Notification] = []
+            notified_users: set[uuid.UUID] = {actor_id}
+            if task.assignee_id and task.assignee_id not in notified_users:
+                notified_users.add(task.assignee_id)
+                notif = await self.collab_repo.create_notification(
                     user_id=task.assignee_id,
                     actor_id=actor_id,
                     organization_id=task.organization_id,
@@ -1040,6 +1108,21 @@ class TaskService:
                     resource_type="task",
                     resource_id=task.id,
                 )
+                status_notifications.append(notif)
+
+            if task.reporter_id and task.reporter_id not in notified_users:
+                notified_users.add(task.reporter_id)
+                notif = await self.collab_repo.create_notification(
+                    user_id=task.reporter_id,
+                    actor_id=actor_id,
+                    organization_id=task.organization_id,
+                    type="task_status_changed",
+                    title=f"Status Changed on {task.issue_key}",
+                    message=f"Task {task.issue_key} was moved to {new_status_name}",
+                    resource_type="task",
+                    resource_id=task.id,
+                )
+                status_notifications.append(notif)
 
         if request.rank is not None and request.rank != task.rank:
             await self.work_item_repo.record_activity(
@@ -1055,7 +1138,7 @@ class TaskService:
         await self.session.commit()
         await self.session.refresh(task)
 
-        if status_notif:
+        for status_notif in status_notifications:
             await self.broadcaster.broadcast_to_user(
                 status_notif.user_id,
                 "notification_created",
@@ -1083,10 +1166,12 @@ class TaskService:
                     ),
                     "is_read": status_notif.is_read,
                     "created_at": status_notif.created_at.isoformat(),
+                    "updated_at": status_notif.updated_at.isoformat(),
                 },
             )
 
         return task
+
 
     async def delete_task(
         self,

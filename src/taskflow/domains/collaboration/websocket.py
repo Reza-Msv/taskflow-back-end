@@ -13,9 +13,10 @@ logger = logging.getLogger(__name__)
 class NotificationBroadcaster(Protocol):
     """Protocol defining interface for dispatching real-time notifications."""
 
-    async def connect(self, user_id: uuid.UUID, websocket: WebSocket) -> None:
+    async def connect(self, user_id: uuid.UUID, websocket: WebSocket) -> bool:
         """Register active WebSocket for a user."""
         ...
+
 
     async def disconnect(self, user_id: uuid.UUID, websocket: WebSocket) -> None:
         """Unregister active WebSocket for a user."""
@@ -50,23 +51,45 @@ class InMemoryConnectionManager:
     in multi-node deployments.
     """
 
-    def __init__(self) -> None:
+    DEFAULT_MAX_CONNECTIONS_PER_USER: int = 10
+
+    def __init__(
+        self,
+        max_connections_per_user: int = DEFAULT_MAX_CONNECTIONS_PER_USER,
+    ) -> None:
         # Maps user_id -> set of active WebSocket instances
         self._connections: dict[uuid.UUID, set[WebSocket]] = {}
         self._lock = asyncio.Lock()
+        self.max_connections_per_user = max_connections_per_user
 
-    async def connect(self, user_id: uuid.UUID, websocket: WebSocket) -> None:
-        """Accept handshake and record connection under user_id."""
-        await websocket.accept()
+    async def connect(self, user_id: uuid.UUID, websocket: WebSocket) -> bool:
+        """Accept handshake and record connection under user_id if within limits."""
         async with self._lock:
+            user_sockets = self._connections.get(user_id, set())
+            if len(user_sockets) >= self.max_connections_per_user:
+                logger.warning(
+                    "WebSocket rejected: user %s exceeded max connections (%d)",
+                    user_id,
+                    self.max_connections_per_user,
+                )
+
+                await websocket.close(
+                    code=1008,
+                    reason="Connection limit exceeded for user.",
+                )
+                return False
+
+            await websocket.accept()
             if user_id not in self._connections:
                 self._connections[user_id] = set()
             self._connections[user_id].add(websocket)
+
         logger.debug(
-            "WebSocket connected for user %s (total for user: %d)",
+            "WebSocket connected for user %s (active connections for user: %d)",
             user_id,
             len(self._connections.get(user_id, set())),
         )
+        return True
 
     async def disconnect(self, user_id: uuid.UUID, websocket: WebSocket) -> None:
         """Remove WebSocket instance from active user connections."""
@@ -85,6 +108,7 @@ class InMemoryConnectionManager:
     ) -> int:
         """
         Send JSON payload to all active WebSockets for given user.
+        Adheres to standardized envelope while maintaining backward compatibility.
         Automatically cleans up any broken or disconnected sockets.
         Returns the number of successful deliveries.
         """
@@ -94,10 +118,21 @@ class InMemoryConnectionManager:
         if not sockets:
             return 0
 
+        event_id = str(uuid.uuid4())
+        timestamp = datetime.now(UTC).isoformat()
+
+        # Permitted notification representation if event conveys a notification
+        is_notification_event = event in ("notification_created", "notification_read")
+        notification_representation = payload if is_notification_event else None
+
         message = {
+            "type": event,
             "event": event,
+            "event_id": event_id,
+            "notification": notification_representation,
             "data": payload,
-            "timestamp": datetime.now(UTC).isoformat(),
+            "created_at": timestamp,
+            "timestamp": timestamp,
         }
 
         sent_count = 0
@@ -122,8 +157,14 @@ class InMemoryConnectionManager:
                         self._connections[user_id].discard(ws)
                     if not self._connections[user_id]:
                         del self._connections[user_id]
+            logger.debug(
+                "Cleaned up %d disconnected WebSocket(s) for user %s",
+                len(dead_sockets),
+                user_id,
+            )
 
         return sent_count
+
 
     async def broadcast_to_users(
         self,

@@ -28,13 +28,17 @@ Authentication occurs strictly during the HTTP-to-WebSocket upgrade handshake us
 1. **Cookie-Based Authentication (Default & Recommended for Browsers)**:
    - Handshake includes the standard `taskflow_session` HttpOnly cookie.
    - Handled automatically by the browser when establishing `new WebSocket(...)` from the same origin or configured CORS credentials.
+   - **Cross-Site WebSocket Hijacking (CSWSH) Mitigation**: When cookie authentication is used, the server verifies the `Origin` header against `BACKEND_CORS_ORIGINS`. Disallowed origins are rejected with `1008 (WS_1008_POLICY_VIOLATION)`.
 2. **Bearer Token Header (Native / Mobile / Headless Clients)**:
    - Handshake includes `Authorization: Bearer <session_token>`.
 
-### Handshake Rejection
-If the session cookie or token is missing, invalid, or expired:
-- The WebSocket connection is immediately closed before handshake completion with close code **`1008 (WS_1008_POLICY_VIOLATION)`** and reason `"Unauthorized"`.
-- The client receives an authentication failure event and should not attempt infinite reconnects without refreshing the session.
+### Handshake Rejection & Resource Limits
+- If the session cookie or token is missing, invalid, or expired:
+  The connection is closed before handshake completion with close code **`1008 (WS_1008_POLICY_VIOLATION)`** and reason `"Invalid, expired, or inactive session."`.
+- **Origin Violation**: If cookie-authenticated and `Origin` does not match allowed CORS origins, closed with close code **`1008`** and reason `"Origin not allowed."`.
+- **Per-User Connection Limit**: Maximum 10 concurrent active connections per user. The 11th connection is rejected with **`1008`** ("Connection limit exceeded for user.") to guard against socket exhaustion DoS.
+- **Message Size Limit**: Incoming client text frames are restricted to 4096 bytes (4 KB). Larger frames are closed with code **`1009 (Message too large)`**.
+- **No Arbitrary Messaging**: The WebSocket endpoint is strictly a delivery channel for notifications and keepalive `ping`/`pong`. Arbitrary client-to-server messaging is rejected.
 
 ---
 
@@ -42,7 +46,7 @@ If the session cookie or token is missing, invalid, or expired:
 
 ### Persist-Before-Broadcast Flow
 Notifications are **always committed to the PostgreSQL database before being broadcast**:
-1. User action triggers an event (e.g. Task Assigned, Comment Mention, Status Changed).
+1. User action triggers a domain event (e.g. Task Assigned, Task Due Date Changed, Comment Mention, Status Changed).
 2. Domain service creates and persists `Notification` record(s) within the database transaction.
 3. The database transaction is committed (`await session.commit()`).
 4. Upon successful commit, `NotificationBroadcaster.broadcast_to_user(user_id, event, payload)` dispatches the event.
@@ -67,7 +71,20 @@ Notifications are **always committed to the PostgreSQL database before being bro
 
 ## 4. Message Schema & Events
 
-All WebSocket frames are JSON strings adhering to `{ "event": string, "data": object }`.
+All WebSocket frames are JSON strings adhering to a standardized event envelope containing `type`, `event_id`, `created_at`, `notification`, and backward-compatible `event` and `data` keys.
+
+### Standardized Event Envelope Structure
+```json
+{
+  "type": "notification_created",
+  "event": "notification_created",
+  "event_id": "7b0a88dc-8ee3-490b-ba62-349f43a9dc9e",
+  "notification": { ... },
+  "data": { ... },
+  "created_at": "2026-10-27T10:00:00.000000Z",
+  "timestamp": "2026-10-27T10:00:00.000000Z"
+}
+```
 
 ### Server-to-Client Events
 
@@ -75,11 +92,16 @@ All WebSocket frames are JSON strings adhering to `{ "event": string, "data": ob
 Dispatched immediately when the connection is authorized and registered.
 ```json
 {
+  "type": "connected",
   "event": "connected",
+  "event_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "notification": null,
   "data": {
     "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-    "timestamp": "2026-10-20T13:30:00.000000Z"
-  }
+    "timestamp": "2026-10-27T10:00:00.000000Z"
+  },
+  "created_at": "2026-10-27T10:00:00.000000Z",
+  "timestamp": "2026-10-27T10:00:00.000000Z"
 }
 ```
 
@@ -87,17 +109,31 @@ Dispatched immediately when the connection is authorized and registered.
 Dispatched when a new notification is generated for the authenticated user.
 ```json
 {
+  "type": "notification_created",
   "event": "notification_created",
-  "data": {
+  "event_id": "c1f72e9a-7b3d-4c8d-8e4b-123456789abc",
+  "notification": {
     "id": "c1f72e9a-7b3d-4c8d-8e4b-123456789abc",
     "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "actor_id": "4d1a2b3c-0000-0000-0000-111122223333",
+    "organization_id": "8e3b4a2c-1111-2222-3333-444455556666",
     "type": "task_assigned",
     "title": "Task Assigned",
     "message": "Alice assigned you to 'Refactor authentication flow'",
+    "resource_type": "task",
+    "resource_id": "e4d2a1b0-9c8d-4e7f-a1b2-c3d4e5f6a7b8",
     "is_read": false,
-    "task_id": "e4d2a1b0-9c8d-4e7f-a1b2-c3d4e5f6a7b8",
-    "created_at": "2026-10-20T13:30:00.000000Z"
-  }
+    "created_at": "2026-10-27T10:00:00.000000Z",
+    "updated_at": "2026-10-27T10:00:00.000000Z",
+    "actor": {
+      "id": "4d1a2b3c-0000-0000-0000-111122223333",
+      "email": "alice@example.com",
+      "full_name": "Alice Smith"
+    }
+  },
+  "data": { ... },
+  "created_at": "2026-10-27T10:00:00.000000Z",
+  "timestamp": "2026-10-27T10:00:00.000000Z"
 }
 ```
 
@@ -105,12 +141,17 @@ Dispatched when a new notification is generated for the authenticated user.
 Dispatched when a single notification is marked as read via REST, keeping multi-tab sessions in sync.
 ```json
 {
+  "type": "notification_read",
   "event": "notification_read",
-  "data": {
+  "event_id": "d2f83e0b-8c4e-5d9e-9f5c-234567890def",
+  "notification": {
     "id": "c1f72e9a-7b3d-4c8d-8e4b-123456789abc",
     "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
     "is_read": true
-  }
+  },
+  "data": { ... },
+  "created_at": "2026-10-27T10:01:00.000000Z",
+  "timestamp": "2026-10-27T10:01:00.000000Z"
 }
 ```
 
@@ -118,10 +159,16 @@ Dispatched when a single notification is marked as read via REST, keeping multi-
 Dispatched when all notifications for the user are marked as read via `POST /api/v1/notifications/read-all`.
 ```json
 {
+  "type": "notifications_all_read",
   "event": "notifications_all_read",
+  "event_id": "e3a94f1c-9d5f-6e0f-0a6d-345678901ef0",
+  "notification": null,
   "data": {
-    "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
-  }
+    "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "marked_count": 5
+  },
+  "created_at": "2026-10-27T10:02:00.000000Z",
+  "timestamp": "2026-10-27T10:02:00.000000Z"
 }
 ```
 
@@ -129,7 +176,15 @@ Dispatched when all notifications for the user are marked as read via `POST /api
 Response to a client-initiated keepalive ping.
 ```json
 {
-  "event": "pong"
+  "type": "pong",
+  "event": "pong",
+  "event_id": "f4b05a2d-0e6a-7f1a-1b7e-456789012fa1",
+  "notification": null,
+  "data": {
+    "timestamp": "2026-10-27T10:03:00.000000Z"
+  },
+  "created_at": "2026-10-27T10:03:00.000000Z",
+  "timestamp": "2026-10-27T10:03:00.000000Z"
 }
 ```
 
@@ -138,12 +193,13 @@ Response to a client-initiated keepalive ping.
 ### Client-to-Server Events
 
 #### `ping`
-Client keepalive ping. The server immediately replies with `{"event": "pong"}`.
+Client keepalive ping. Format: `{"event": "ping"}` or `{"type": "ping"}`. The server immediately replies with the `pong` envelope.
 ```json
 {
   "event": "ping"
 }
 ```
+
 
 ---
 
@@ -182,9 +238,33 @@ When scaling out horizontally across multiple containers/pods behind a load bala
 3. A Redis-backed broadcaster (`RedisNotificationBroadcaster`) subscribes to user channels for locally connected users and forwards frames across local sockets.
 4. No application code or domain service logic changes are required because the domain calls the `NotificationBroadcaster` interface.
 
+### Multi-Instance Limitations (Current State)
+> [!IMPORTANT]
+> The default deployment uses `InMemoryConnectionManager`. When running multiple backend worker processes or horizontal container instances, WebSocket messages broadcast by instance A will only reach clients connected to instance A. For multi-node production clusters, configure a shared message broker such as Redis Pub/Sub using the `NotificationBroadcaster` abstraction shown above.
+
 ---
 
-## 7. Frontend Integration Guide (TypeScript)
+## 7. Reconnection & Missed-Events Reconciliation
+
+WebSocket connections can drop due to transient network issues, device sleep, or server restarts. TaskFlow guarantees zero event loss through its **Persist-Before-Broadcast** model combined with REST delta reconciliation:
+
+1. **Client Event Tracking**:
+   The client records the ISO timestamp (`created_at`) of the most recently received notification or event envelope.
+2. **Reconnection**:
+   The client re-establishes the WebSocket connection using exponential backoff with jitter.
+3. **Delta Reconciliation via REST**:
+   Immediately upon successful WebSocket reconnection, the client issues a REST request to reconcile missed events:
+   ```http
+   GET /api/v1/notifications?since={last_seen_iso_timestamp}
+   ```
+   The backend returns all notifications created strictly after `since`, sorted chronologically with stable secondary ID ordering.
+4. **Idempotency & Deduplication**:
+   Clients use `notification.id` or `envelope.event_id` to deduplicate any notifications received simultaneously over the new socket and the delta REST query.
+
+---
+
+## 8. Frontend Integration Guide (TypeScript)
+
 
 Below is the production-ready TypeScript client implementation for real-time notifications with:
 - Bounded exponential backoff with jitter for reconnection.

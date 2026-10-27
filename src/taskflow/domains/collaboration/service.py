@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from fastapi import status
@@ -410,11 +411,33 @@ class CollaborationService:
         comment.content = request.content.strip()
         comment.is_edited = True
 
+        new_notifications: list[Notification] = []
         if request.mentioned_user_ids is not None:
+            existing_mention_ids = {m.user_id for m in (comment.mentions or [])}
             validated_ids = await self.validate_mentioned_users(
                 task, request.mentioned_user_ids
             )
             await self.collab_repo.set_comment_mentions(comment.id, validated_ids)
+
+            actor = await self.session.get(User, actor_id)
+            actor_name = actor.full_name if actor else "A team member"
+
+            for uid in validated_ids:
+                if uid != actor_id and uid not in existing_mention_ids:
+                    notif = await self.collab_repo.create_notification(
+                        user_id=uid,
+                        actor_id=actor_id,
+                        organization_id=task.organization_id,
+                        type="task_mentioned",
+                        title=f"Mentioned in {task.issue_key}",
+                        message=(
+                            f"{actor_name} mentioned you in an updated comment on "
+                            f"{task.issue_key}: {task.title}"
+                        ),
+                        resource_type="task",
+                        resource_id=task.id,
+                    )
+                    new_notifications.append(notif)
 
         snippet = (
             (comment.content[:80] + "...")
@@ -430,6 +453,15 @@ class CollaborationService:
         )
 
         await self.session.commit()
+
+        # Real-time WebSocket delivery after successful database commit
+        for n in new_notifications:
+            await self.broadcaster.broadcast_to_user(
+                n.user_id,
+                "notification_created",
+                self._to_notification_payload(n),
+            )
+
         reloaded = await self.collab_repo.get_comment_by_id(comment.id)
         assert reloaded is not None
         return self._to_comment_response(reloaded)
@@ -503,8 +535,8 @@ class CollaborationService:
             actor=self._to_user_brief(notif.actor),
         )
 
-    @staticmethod
-    def _to_notification_payload(notif: Notification) -> dict[str, Any]:
+    def _to_notification_payload(self, notif: Notification) -> dict[str, Any]:
+        actor_brief = self._to_user_brief(notif.actor)
         return {
             "id": str(notif.id),
             "user_id": str(notif.user_id),
@@ -519,6 +551,10 @@ class CollaborationService:
             "resource_id": str(notif.resource_id) if notif.resource_id else None,
             "is_read": notif.is_read,
             "created_at": notif.created_at.isoformat(),
+            "updated_at": notif.updated_at.isoformat(),
+            "actor": (
+                actor_brief.model_dump(mode="json") if actor_brief else None
+            ),
         }
 
     async def list_notifications(
@@ -527,12 +563,14 @@ class CollaborationService:
         unread_only: bool = False,
         page: int = 1,
         page_size: int = 25,
+        since: datetime | None = None,
     ) -> NotificationListResponse:
         """Fetch paginated notifications for current user."""
         skip = (page - 1) * page_size
         notifications, total = await self.collab_repo.list_notifications(
             user_id=user_id,
             unread_only=unread_only,
+            since=since,
             skip=skip,
             limit=page_size,
         )
@@ -545,6 +583,7 @@ class CollaborationService:
             total=total,
             unread_count=unread_count,
         )
+
 
     async def get_unread_notification_count(self, user_id: uuid.UUID) -> int:
         """Get count of unread notifications for quick UI badges."""
